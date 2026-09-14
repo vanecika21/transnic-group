@@ -1,4 +1,4 @@
-import { supabase } from "../../../../lib/supabase";
+import { supabase } from "../../../lib/supabase";
 
 /**
  * Ruta de backup. Poate fi apelată în 2 moduri:

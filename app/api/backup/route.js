@@ -1,69 +1,42 @@
-import { supabase } from "../../../lib/supabase";
+import { supabase } from "../../../../lib/supabase";
 
-export async function GET() {
-  const { data, error } = await supabase
+/**
+ * Ruta de backup. Poate fi apelată în 2 moduri:
+ *  1) automat, de Vercel Cron (vezi vercel.json), care trimite
+ *     Authorization: Bearer <CRON_SECRET>
+ *  2) manual, de tine, din Console, cu același header, ca test.
+ *
+ * Copiază tot rândul curent "main" din fleet_data într-un rând nou
+ * în fleet_data_daily_backups, cu data/ora exactă a salvării.
+ */
+export async function GET(request) {
+  const authHeader = request.headers.get("authorization") || "";
+  const expected = `Bearer ${process.env.CRON_SECRET}`;
+
+  if (!process.env.CRON_SECRET || authHeader !== expected) {
+    return Response.json({ error: "Neautorizat." }, { status: 401 });
+  }
+
+  // 1) citește starea curentă din fleet_data (id = "main")
+  const { data: row, error: readError } = await supabase
     .from("fleet_data")
     .select("data")
     .eq("id", "main")
     .single();
 
-  if (error && error.code !== "PGRST116") {
-    return Response.json({ error: error.message }, { status: 500 });
-  }
-  return Response.json({ data: data ? data.data : null });
-}
-
-function looksSuspiciouslyEmpty(body) {
-  const hasCars = Array.isArray(body?.cars) && body.cars.length > 0;
-  const hasDrivers = Array.isArray(body?.drivers) && body.drivers.length > 0;
-  return !hasCars && !hasDrivers;
-}
-
-export async function POST(request) {
-  const body = await request.json();
-
-  const { data: existingRow } = await supabase
-    .from("fleet_data")
-    .select("data")
-    .eq("id", "main")
-    .single();
-  const existing = existingRow ? existingRow.data : null;
-  const existingHasData =
-    existing &&
-    ((Array.isArray(existing.cars) && existing.cars.length) ||
-      (Array.isArray(existing.drivers) && existing.drivers.length));
-
-  // PLASĂ DE SIGURANȚĂ: dacă exista deja o flotă reală (mașini/șoferi) și ce
-  // vine acum la salvare pare complet gol, refuzăm scrierea. Așa nu se mai
-  // poate repeta ștergerea accidentală a tuturor datelor, indiferent de unde
-  // ar veni bug-ul (client vechi, tab uitat deschis, etc.).
-  if (existingHasData && looksSuspiciouslyEmpty(body)) {
-    return Response.json(
-      {
-        error:
-          "Salvare refuzată: datele trimise nu au nicio mașină și niciun șofer, dar pe server exista deja o flotă. Ca să nu se piardă date din greșeală, scrierea a fost blocată.",
-      },
-      { status: 409 }
-    );
+  if (readError) {
+    return Response.json({ error: readError.message }, { status: 500 });
   }
 
-  // Istoric: păstrăm o copie a stării DINAINTE de suprascriere, ca să poți
-  // recupera manual din Supabase (tabelul fleet_data_history) dacă vreodată
-  // ceva merge prost. Nu blocăm salvarea dacă asta eșuează.
-  if (existing) {
-    try {
-      await supabase.from("fleet_data_history").insert({ data: existing });
-    } catch {
-      // best-effort — nu oprim salvarea principală din cauza istoricului
-    }
+  // 2) scrie o copie nouă în fleet_data_daily_backups
+  const savedAt = new Date().toISOString();
+  const { error: writeError } = await supabase
+    .from("fleet_data_daily_backups")
+    .insert({ data: row ? row.data : null, saved_at: savedAt });
+
+  if (writeError) {
+    return Response.json({ error: writeError.message }, { status: 500 });
   }
 
-  const { error } = await supabase
-    .from("fleet_data")
-    .upsert({ id: "main", data: body, updated_at: new Date().toISOString() });
-
-  if (error) {
-    return Response.json({ error: error.message }, { status: 500 });
-  }
-  return Response.json({ ok: true });
+  return Response.json({ ok: true, saved_at: savedAt });
 }

@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 
-// Rute care rămân accesibile FĂRĂ cod (altfel te-ai bloca singur afară).
-const PUBLIC_PATHS = ["/login", "/api/login"];
+// Rute care rămân accesibile FĂRĂ cod de sesiune (altfel te-ai bloca singur afară,
+// sau cron-ul de backup declanșat automat de Vercel nu ar mai putea rula deloc —
+// robotul Vercel nu are cookie de sesiune, doar Authorization: Bearer CRON_SECRET,
+// verificat separat, în interiorul rutei /api/backup).
+const PUBLIC_PATHS = ["/login", "/api/login", "/api/backup"];
 
 export function middleware(request) {
   const { pathname } = request.nextUrl;

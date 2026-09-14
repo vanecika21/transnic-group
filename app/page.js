@@ -650,7 +650,7 @@ function Shell({ tab, setTab, children, loading, saveError }) {
 
         <div className="tfp-body">{children}</div>
 
-        <div className="tfp-footer">© {new Date().getFullYear()} Nichita Ivanov. Toate drepturile rezervate.</div>
+        <div className="tfp-footer" suppressHydrationWarning>© {new Date().getFullYear()} Nichita Ivanov. Toate drepturile rezervate.</div>
       </div>
     </div>
   );
@@ -660,7 +660,9 @@ function Shell({ tab, setTab, children, loading, saveError }) {
 /* ============================== DASHBOARD ============================== */
 
 function Dashboard({ data, setTab }) {
-  const now = nowMoldova();
+  const [now, setNow] = useState(null);
+  useEffect(() => { setNow(nowMoldova()); }, []);
+  if (!now) return null;
   const year = now.getFullYear(), month = now.getMonth(), day = now.getDate();
   const ranges = weekRanges(year, month);
   const wIdx = currentWeekIndex(year, month, day, ranges);

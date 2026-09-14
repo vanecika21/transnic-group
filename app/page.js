@@ -52,6 +52,19 @@ function fmtMoney(n) {
   const v = Number(n) || 0;
   return v.toLocaleString("ro-RO", { maximumFractionDigits: 0 }) + " lei";
 }
+// Formatare de dată consistentă (zi/lună/an), cu fusul orar FIXAT explicit la
+// Europe/Chisinau — nu lăsăm fusul implicit al motorului JS (server vs.
+// browser pot diferi) să schimbe ziua afișată pentru date de tip "doar dată"
+// (ex: "2026-01-15"), care se parsează la miezul nopții UTC.
+function fmtDateRO(dateStr) {
+  if (!dateStr) return "";
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("ro-RO", {
+    timeZone: "Europe/Chisinau",
+    day: "2-digit", month: "2-digit", year: "numeric",
+  }).format(d);
+}
 function daysInMonth(year, month) { return new Date(year, month + 1, 0).getDate(); }
 function monthKey(y, m) { return `${y}-${String(m + 1).padStart(2, "0")}`; }
 function isSunday(year, month, day) { return new Date(year, month, day).getDay() === 0; }
@@ -482,6 +495,18 @@ export default function TaxiFleetPro() {
 /* ============================== SHELL ============================== */
 
 function Shell({ tab, setTab, children, loading, saveError }) {
+  // Anul din footer NU se calculează direct în JSX cu `new Date()`. Dacă am
+  // face asta, Shell fiind randat mereu (inclusiv pe ramura de "loading"),
+  // orice diferență de moment/fus orar/cache între randarea de pe server și
+  // prima randare din browser ar produce o eroare de hidratare React
+  // (#418/#423/#425). În loc de asta: pornim cu `null` (identic pe server și
+  // pe primul randare din client) și completăm anul abia după montare, într-un
+  // useEffect — moment în care suntem garantat doar pe client.
+  const [footerYear, setFooterYear] = useState(null);
+  useEffect(() => {
+    setFooterYear(new Date().getFullYear());
+  }, []);
+
   const navGroups = [
     { label: "General", items: [
       { id: "dashboard", label: "Dashboard", icon: Gauge },
@@ -650,7 +675,7 @@ function Shell({ tab, setTab, children, loading, saveError }) {
 
         <div className="tfp-body">{children}</div>
 
-        <div className="tfp-footer" suppressHydrationWarning>© {new Date().getFullYear()} Nichita Ivanov. Toate drepturile rezervate.</div>
+        <div className="tfp-footer">© {footerYear ?? ""} Nichita Ivanov. Toate drepturile rezervate.</div>
       </div>
     </div>
   );
@@ -660,9 +685,7 @@ function Shell({ tab, setTab, children, loading, saveError }) {
 /* ============================== DASHBOARD ============================== */
 
 function Dashboard({ data, setTab }) {
-  const [now, setNow] = useState(null);
-  useEffect(() => { setNow(nowMoldova()); }, []);
-  if (!now) return null;
+  const now = nowMoldova();
   const year = now.getFullYear(), month = now.getMonth(), day = now.getDate();
   const ranges = weekRanges(year, month);
   const wIdx = currentWeekIndex(year, month, day, ranges);
@@ -977,8 +1000,8 @@ function CarForm({ car, drivers, onSave, onCancel }) {
 
 function UnavailablePeriodsEditor({ periods, onChange }) {
   const [reason, setReason] = useState("service");
-  const [start, setStart] = useState(todayISO());
-  const [end, setEnd] = useState(todayISO());
+  const [start, setStart] = useState(() => todayISO());
+  const [end, setEnd] = useState(() => todayISO());
   const [undefinedPeriod, setUndefinedPeriod] = useState(false);
   const [note, setNote] = useState("");
 
@@ -1002,7 +1025,7 @@ function UnavailablePeriodsEditor({ periods, onChange }) {
               <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 8, background: "#ffffff0d", borderRadius: 8, padding: "7px 10px", flexWrap: "wrap" }}>
                 <span className="pill" style={{ background: "#f2841c22", color: "var(--orange)" }}>{UNAVAILABLE_REASONS[p.reason] || "Altul"}</span>
                 <span style={{ fontSize: 12.5 }}>
-                  {new Date(p.start).toLocaleDateString("ro-RO")} – {p.end ? new Date(p.end).toLocaleDateString("ro-RO") : <span style={{ color: "var(--amber)" }}>nedeterminat</span>}
+                  {fmtDateRO(p.start)} – {p.end ? fmtDateRO(p.end) : <span style={{ color: "var(--amber)" }}>nedeterminat</span>}
                   {p.note ? <span style={{ color: "var(--muted)" }}> · {p.note}</span> : null}
                 </span>
                 {!p.end && (
@@ -1122,9 +1145,9 @@ function DriverForm({ driver, onSave, onCancel }) {
 /* ============================== WEEKLY CALENDAR ============================== */
 
 function WeeklyCalendarView({ data, update }) {
+  const [year, setYear] = useState(() => nowMoldova().getFullYear());
+  const [month, setMonth] = useState(() => nowMoldova().getMonth());
   const now = nowMoldova();
-  const [year, setYear] = useState(now.getFullYear());
-  const [month, setMonth] = useState(now.getMonth());
   const [search, setSearch] = useState("");
   const [driverFilter, setDriverFilter] = useState("toate");
   const [expandedId, setExpandedId] = useState(null);
@@ -1348,7 +1371,7 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
         <div style={{ padding: "0 16px 10px", display: "flex", flexWrap: "wrap", gap: 6 }}>
           {periodsThisMonth.map((p) => (
             <span key={p.id} className="pill" style={{ background: "#f2841c22", color: "var(--orange)" }}>
-              {UNAVAILABLE_REASONS[p.reason] || "Nu lucrează"}: {new Date(p.start).toLocaleDateString("ro-RO")}–{p.end ? new Date(p.end).toLocaleDateString("ro-RO") : "nedeterminat"}
+              {UNAVAILABLE_REASONS[p.reason] || "Nu lucrează"}: {fmtDateRO(p.start)}–{p.end ? fmtDateRO(p.end) : "nedeterminat"}
             </span>
           ))}
         </div>
@@ -1357,7 +1380,7 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
       <div style={{ padding: "0 16px 10px", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         {car.startDate ? (
           <span className="pill" style={{ background: "#ffffff0d", color: "var(--muted)" }}>
-            Activ din {new Date(car.startDate).toLocaleDateString("ro-RO")}
+            Activ din {fmtDateRO(car.startDate)}
             <button type="button" onClick={(e) => { e.stopPropagation(); setEditingStart((v) => !v); }} style={{ background: "none", border: "none", padding: 0, marginLeft: 4, cursor: "pointer", color: "var(--muted)", display: "flex" }}><Pencil size={11} /></button>
             <button type="button" onClick={clearStart} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: "var(--muted)", display: "flex" }}><X size={12} /></button>
           </span>
@@ -1806,9 +1829,8 @@ function InspectionForm({ insp, cars, onSave, onCancel }) {
 /* ============================== FINANCE ============================== */
 
 function FinanceView({ data, update }) {
-  const now = nowMoldova();
-  const [year, setYear] = useState(now.getFullYear());
-  const [month, setMonth] = useState(now.getMonth());
+  const [year, setYear] = useState(() => nowMoldova().getFullYear());
+  const [month, setMonth] = useState(() => nowMoldova().getMonth());
   const mk = monthKey(year, month);
   const [showExpense, setShowExpense] = useState(false);
   const [showIncome, setShowIncome] = useState(false);
@@ -1920,7 +1942,7 @@ const restante = data.cars.reduce((s, car) => {
                       <td>
                         {e.descriere}
                         <div style={{ fontSize: 11, color: "var(--muted)" }}>
-                          {e.categorie} · {new Date(e.data).toLocaleDateString("ro-RO")}{drv ? ` · ${drv.nume}` : ""}
+                          {e.categorie} · {fmtDateRO(e.data)}{drv ? ` · ${drv.nume}` : ""}
                           {(e.cash || e.card) ? ` · Num ${fmtMoney(e.cash || 0)} / Card ${fmtMoney(e.card || 0)}` : ""}
                         </div>
                       </td>
@@ -1988,7 +2010,7 @@ const restante = data.cars.reduce((s, car) => {
 }
 
 function DayIncomeModal({ data, onClose }) {
-  const [date, setDate] = useState(todayISO());
+  const [date, setDate] = useState(() => todayISO());
   const [y, m, d] = date.split("-").map(Number);
   let cash = 0, card = 0, found = false;
   Object.values(data.weeklyPayments).forEach((rec) => {
@@ -2028,7 +2050,7 @@ function MiniStat({ label, value, color }) {
 }
 
 function ExpenseForm({ onSave, onCancel, drivers }) {
-  const [f, setF] = useState({ data: todayISO(), descriere: "", categorie: "Motorină", șoferId: "", cash: "", card: "" });
+  const [f, setF] = useState(() => ({ data: todayISO(), descriere: "", categorie: "Motorină", șoferId: "", cash: "", card: "" }));
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
   const suma = Number(f.cash || 0) + Number(f.card || 0);
   return (
@@ -2063,7 +2085,7 @@ function ExpenseForm({ onSave, onCancel, drivers }) {
 }
 
 function IncomeForm({ onSave, onCancel }) {
-  const [f, setF] = useState({ data: todayISO(), descriere: "", suma: "" });
+  const [f, setF] = useState(() => ({ data: todayISO(), descriere: "", suma: "" }));
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
   return (
     <div>
@@ -2085,7 +2107,7 @@ function IncomeForm({ onSave, onCancel }) {
 // (weeklyPayments, mod "daily"), deci ce introduci aici apare automat și acolo.
 
 function EarningsView({ data, update }) {
-  const [date, setDate] = useState(todayISO());
+  const [date, setDate] = useState(() => todayISO());
   const [search, setSearch] = useState("");
   const [y, m, d] = date.split("-").map(Number);
   const year = y, month = m - 1, day = d;
@@ -2277,9 +2299,8 @@ function EarningsRow({ car, driver, dayRec, worked, onCommit, onToggleWorked }) 
 /* ============================== REPORTS ============================== */
 
 function ReportsView({ data }) {
-  const now = nowMoldova();
-  const [year, setYear] = useState(now.getFullYear());
-  const [month, setMonth] = useState(now.getMonth());
+  const [year, setYear] = useState(() => nowMoldova().getFullYear());
+  const [month, setMonth] = useState(() => nowMoldova().getMonth());
   const [filter, setFilter] = useState("toate");
   const [search, setSearch] = useState("");
 

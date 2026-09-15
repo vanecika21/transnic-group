@@ -44,8 +44,6 @@ const emptyData = () => ({
   incomes: [],
   insurances: [],
   inspections: [],
-  yandexDrivers: [],   // șoferi sincronizați din Yandex Fleet API
-  yandexEarnings: {},  // key `${date}__${yandexDriverId}` -> {date, yandex_driver_id, total_cash, total_card, total_gross, yandex_commission, park_commission, net_payout}
 });
 
 function fmtMoney(n) {

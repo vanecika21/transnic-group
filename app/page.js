@@ -712,7 +712,7 @@ function Dashboard({ data, setTab }) {
   const cashCardToday = (() => {
     let cash = 0, card = 0;
     Object.values(data.weeklyPayments || {}).forEach((rec) => {
-      if (rec.year !== year || rec.month !== month || rec.mode !== "daily" || !rec.dailyAmounts) return;
+      if (rec.year !== year || rec.month !== month || !rec.dailyAmounts) return;
       const d = rec.dailyAmounts[day];
       if (!d || d.worked === false) return;
       cash += Number(d.cash || 0);
@@ -1849,7 +1849,7 @@ const restante = data.cars.reduce((s, car) => {
   const dailyBreakdown = useMemo(() => {
     const map = {};
     Object.values(data.weeklyPayments).forEach((rec) => {
-      if (rec.year !== year || rec.month !== month || rec.mode !== "daily" || !rec.dailyAmounts) return;
+      if (rec.year !== year || rec.month !== month || !rec.dailyAmounts) return;
       Object.entries(rec.dailyAmounts).forEach(([day, d]) => {
         if (d.worked === false) return;
         const k = Number(day);
@@ -2012,7 +2012,7 @@ function DayIncomeModal({ data, onClose }) {
   const [y, m, d] = date.split("-").map(Number);
   let cash = 0, card = 0, found = false;
   Object.values(data.weeklyPayments).forEach((rec) => {
-    if (rec.year !== y || rec.month !== m - 1 || rec.mode !== "daily" || !rec.dailyAmounts) return;
+    if (rec.year !== y || rec.month !== m - 1 || !rec.dailyAmounts) return;
     const dayRec = rec.dailyAmounts[d];
     if (!dayRec || dayRec.worked === false) return;
     found = true;
@@ -2174,7 +2174,7 @@ function EarningsView({ data, update }) {
   const leaderboard = useMemo(() => {
     const map = new Map(); // driverId -> total
     Object.values(data.weeklyPayments).forEach((rec) => {
-      if (rec.year !== year || rec.month !== month || rec.mode !== "daily" || !rec.dailyAmounts) return;
+      if (rec.year !== year || rec.month !== month || !rec.dailyAmounts) return;
       const driverId = rec.driverId || (data.cars.find((c) => c.id === rec.carId) || {}).driverId;
       if (!driverId) return;
       const driver = data.drivers.find((dr) => dr.id === driverId);

@@ -10,9 +10,12 @@ import {
    Taxi Fleet Pro Cloud (web version)
    Data stored in Supabase via /api/data.
    Payment model: weekly. Each month is split into 4 fixed sections
-   (1-7, 8-14, 15-21, 22-end). Sundays don't count toward the plan.
-   If a car doesn't reach its monthly plan, the shortfall is added
-   automatically to the next month's plan.
+   (1-7, 8-14, 15-21, 22-end). Șoferii aduc planul de obicei O DATĂ PE
+   SĂPTĂMÂNĂ, așa că o săptămână devine restanță abia după ce s-a
+   terminat + GRACE_DAYS zile. Până atunci apare "Așteptăm plata".
+   Restanța aparține ȘOFERULUI (nu mașinii). Istoricul "cine a condus
+   mașina și de când" e în data.assignments, ca la schimbarea șoferului
+   restanța veche să rămână la șoferul vechi.
 ---------------------------------------------------------------- */
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -33,17 +36,22 @@ const todayISO = () => {
 const MONTHS_RO = ["Ianuarie","Februarie","Martie","Aprilie","Mai","Iunie","Iulie","August","Septembrie","Octombrie","Noiembrie","Decembrie"];
 const MONTHS_RO_SHORT = ["Ian","Feb","Mar","Apr","Mai","Iun","Iul","Aug","Sep","Oct","Noi","Dec"];
 
+// Câte zile după sfârșitul săptămânii mai așteptăm banii înainte să o numărăm restanță.
+const GRACE_DAYS = 2;
+
 const emptyData = () => ({
   cars: [],
   drivers: [],
   payments: {},        // legacy, unused
-  weeklyPayments: {},  // key `${y}-${mm}__${ownerId}__${weekIdx}`. ownerId = șoferul alocat mașinii la momentul înregistrării
-                        // (sau id-ul mașinii, dacă nu are șofer alocat) -> {year,month,carId,driverId,weekIdx,paidCash,paidCard,paidAmount}
+  weeklyPayments: {},  // key `${y}-${mm}__${ownerId}__${weekIdx}`. ownerId = șoferul care a condus mașina în acea zi
+                        // (sau id-ul mașinii, dacă nu avea șofer) -> {year,month,carId,driverId,weekIdx,paidCash,paidCard,paidAmount}
   debtMigratedToDrivers: false, // devine true după ce restanțele vechi (legate de mașină) sunt migrate pe șofer
   expenses: [],
   incomes: [],
   insurances: [],
   inspections: [],
+  assignments: [],             // [{id, carId, driverId, from:"YYYY-MM-DD"}] — cine conduce mașina de la data "from" ("" = nimeni)
+  assignmentsMigrated: false,
 });
 
 function fmtMoney(n) {
@@ -65,7 +73,7 @@ function fmtDateRO(dateStr) {
 }
 function daysInMonth(year, month) { return new Date(year, month + 1, 0).getDate(); }
 function monthKey(y, m) { return `${y}-${String(m + 1).padStart(2, "0")}`; }
-function isSunday(year, month, day) { return new Date(year, month, day).getDay() === 0; }
+function isoOf(y, m, d) { return `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`; }
 
 // Câte zile pe săptămână lucrează șoferul mașinii (5, 6 sau 7).
 // Implicit 6 = păstrează comportamentul vechi (toate zilele, în afară de duminică).
@@ -112,13 +120,66 @@ function weeklyPaid(data, year, month, ownerId, weekIdx) {
   const r = weeklyRecord(data, year, month, ownerId, weekIdx);
   return r ? Number(r.paidAmount || 0) : 0;
 }
-// Restanța/plata se leagă de ȘOFER (persoană), nu de mașină: dacă mașina are
-// un șofer alocat acum, el e "proprietarul" datoriei. Dacă mașina nu are
-// niciun șofer alocat, rămâne provizoriu legată de mașină (ca să nu se piardă
+
+// Restanța/plata se leagă de ȘOFER (persoană), nu de mașină. Dacă mașina nu
+// are niciun șofer, rămâne provizoriu legată de mașină (ca să nu se piardă
 // date), până se alocă cineva.
 function debtOwnerId(car) {
   return car.driverId || car.id;
 }
+
+// Cine conducea mașina într-o anumită zi (după istoricul data.assignments).
+// Dacă mașina nu are istoric, se folosește șoferul alocat acum.
+function driverOnDay(data, car, year, month, day) {
+  const iso = isoOf(year, month, day);
+  let best = null;
+  let has = false;
+  for (const a of data.assignments || []) {
+    if (a.carId !== car.id) continue;
+    has = true;
+    if (a.from <= iso && (!best || a.from >= best.from)) best = a;
+  }
+  if (best) return best.driverId || "";
+  if (has) return "";
+  return car.driverId || "";
+}
+// Proprietarul datoriei/plății în ziua respectivă: șoferul, sau mașina dacă nu avea șofer.
+function ownerOnDay(data, car, year, month, day) {
+  return driverOnDay(data, car, year, month, day) || car.id;
+}
+// Proprietarul unei săptămâni = cel din ultima zi trecută a săptămânii.
+function weekOwnerId(data, car, year, month, weekIdx, ranges) {
+  const r = ranges[weekIdx];
+  let day = r.end;
+  while (day > r.start && !isDayElapsed(year, month, day)) day--;
+  return ownerOnDay(data, car, year, month, day);
+}
+
+// De când conduce șoferul actual mașina, pentru migrarea inițială.
+function initialAssignmentFrom(data, car) {
+  if (car.startDate) return String(car.startDate).slice(0, 10);
+  let best = null;
+  Object.values(data.weeklyPayments || {}).forEach((rec) => {
+    if (rec && rec.carId === car.id) {
+      const v = rec.year * 12 + rec.month;
+      if (best === null || v < best) best = v;
+    }
+  });
+  if (best === null) return todayISO();
+  return `${Math.floor(best / 12)}-${String((best % 12) + 1).padStart(2, "0")}-01`;
+}
+// Migrare unică: creează istoricul de alocări din șoferii alocați acum mașinilor.
+function migrateAssignments(data) {
+  if (data.assignmentsMigrated) return data;
+  const assignments = [...(data.assignments || [])];
+  data.cars.forEach((car) => {
+    if (!car.driverId) return;
+    if (assignments.some((a) => a.carId === car.id)) return;
+    assignments.push({ id: uid(), carId: car.id, driverId: car.driverId, from: initialAssignmentFrom(data, car) });
+  });
+  return { ...data, assignments, assignmentsMigrated: true };
+}
+
 // Migrare unică: mută restanțele vechi (legate de mașină) pe șoferul care
 // conduce acum acea mașină. Rulează o singură dată, la încărcare — vezi
 // TaxiFleetPro (useEffect) — și e ferită de rulare dublă prin flag-ul
@@ -208,106 +269,115 @@ function unavailablePeriodOnDay(car, year, month, day) {
     return dateOnly <= eOnly;
   }) || null;
 }
-function workingDaysEffective(data, car, year, month, weekIdx, ranges) {
-  if (!isCarActive(car)) return 0;
-  const r = ranges[weekIdx];
-  const rec = weeklyRecord(data, year, month, debtOwnerId(car), weekIdx);
-  let count = 0;
-  for (let d = r.start; d <= r.end; d++) {
-    const dayRec = rec && rec.dailyAmounts ? rec.dailyAmounts[d] : null;
-    if (!isCarWorkDay(car, year, month, d)) {
-      // Zi liberă în mod normal (de regulă duminica) — o numărăm în plan
-      // DOAR dacă a fost bifată explicit opțiunea "Numără în plan" pe ziua asta.
-      if (!(isSunday(year, month, d) && dayRec && dayRec.countsInPlan)) continue;
-    }
-    if (!isDayActive(car, year, month, d)) continue;
-    if (!isDayElapsed(year, month, d)) continue;
-    if (isDayUnavailable(car, year, month, d)) continue;
-    if (dayRec && dayRec.worked === false) continue;
-    count++;
-  }
-  return count;
-}
-function monthlyPlanBase(data, car, year, month) {
-  const ranges = weekRanges(year, month);
-  const rate = dailyRate(car, year, month);
-  let total = 0;
-  for (let i = 0; i < ranges.length; i++) total += rate * workingDaysEffective(data, car, year, month, i, ranges);
-  return total;
-}
+
 function monthlyPaid(data, year, month, ownerId) {
   const ranges = weekRanges(year, month);
   let sum = 0;
   for (let i = 0; i < ranges.length; i++) sum += weeklyPaid(data, year, month, ownerId, i);
   return sum;
 }
-function hasAnyRecordForMonth(data, year, month, ownerId) {
-  const ranges = weekRanges(year, month);
-  for (let i = 0; i < ranges.length; i++) if (weeklyRecord(data, year, month, ownerId, i)) return true;
-  return false;
-}
 function prevMonth(year, month) { return month === 0 ? { year: year - 1, month: 11 } : { year, month: month - 1 }; }
 
-function carryoverFromPrevMonth(data, car, year, month) {
+// Planul unei săptămâni pentru o mașină. Dacă ownerFilter e dat, se numără doar
+// zilele în care acel proprietar (șofer) a condus mașina.
+// O zi intră în plan dacă: e trecută, mașina era activă și disponibilă, șoferul
+// n-a fost marcat "nu a lucrat", iar dacă e zi liberă (duminică, sau sâmbătă la
+// 5 zile/săpt) — doar dacă ai bifat explicit "Numără în plan".
+function planFor(data, car, year, month, weekIdx, ranges, ownerFilter) {
   if (!isCarActive(car)) return 0;
-  const pm = prevMonth(year, month);
-  if (car.startDate) {
-    const s = new Date(car.startDate);
-    const startOnly = new Date(s.getFullYear(), s.getMonth(), s.getDate());
-    const lastDayPrevMonth = new Date(pm.year, pm.month, daysInMonth(pm.year, pm.month));
-    if (lastDayPrevMonth < startOnly) return 0;
+  const r = ranges[weekIdx];
+  const rate = dailyRate(car, year, month);
+  let n = 0;
+  for (let d = r.start; d <= r.end; d++) {
+    const owner = ownerOnDay(data, car, year, month, d);
+    if (ownerFilter != null && owner !== ownerFilter) continue;
+    const rec = weeklyRecord(data, year, month, owner, weekIdx);
+    const dayRec = rec && rec.dailyAmounts ? rec.dailyAmounts[d] : null;
+    if (!isCarWorkDay(car, year, month, d) && !(dayRec && dayRec.countsInPlan)) continue;
+    if (!isDayActive(car, year, month, d)) continue;
+    if (!isDayElapsed(year, month, d)) continue;
+    if (isDayUnavailable(car, year, month, d)) continue;
+    if (dayRec && dayRec.worked === false) continue;
+    n++;
   }
-  if (!hasAnyRecordForMonth(data, pm.year, pm.month, debtOwnerId(car))) return 0;
-  const plan = monthlyPlanWithCarry(data, car, pm.year, pm.month);
-  const paid = monthlyPaid(data, pm.year, pm.month, debtOwnerId(car));
-  return Math.max(plan - paid, 0);
+  return rate * n;
 }
-function monthlyPlanWithCarry(data, car, year, month) {
-  return monthlyPlanBase(data, car, year, month) + carryoverFromPrevMonth(data, car, year, month);
+// Planul săptămânii pentru un șofer (sau pentru o mașină fără șofer): suma pe toate mașinile pe care le-a condus.
+function driverWeekPlan(data, ownerId, year, month, weekIdx, ranges) {
+  let total = 0;
+  data.cars.forEach((car) => { total += planFor(data, car, year, month, weekIdx, ranges, ownerId); });
+  return total;
 }
-function weekPlan(data, car, year, month, weekIdx, ranges) {
-  if (!isCarActive(car)) return 0;
-  const base = dailyRate(car, year, month) * workingDaysEffective(data, car, year, month, weekIdx, ranges);
-  return weekIdx === 0 ? base + carryoverFromPrevMonth(data, car, year, month) : base;
+
+// O săptămână devine "scadentă" abia după ce s-a terminat + GRACE_DAYS zile.
+function weekIsDue(year, month, range) {
+  const now = nowMoldova();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return today > new Date(year, month, range.end + GRACE_DAYS);
+}
+// Ca statusOf, dar cât timp săptămâna nu e scadentă, "neachitat" devine "pending" (Așteptăm plata).
+function weekStatus(plan, paid, year, month, range) {
+  const st = statusOf(plan, paid);
+  if (st === "unpaid" && !weekIsDue(year, month, range)) return "pending";
+  return st;
+}
+
+function firstRecordYM(data) {
+  let best = null;
+  Object.values(data.weeklyPayments || {}).forEach((rec) => {
+    if (!rec) return;
+    const v = rec.year * 12 + rec.month;
+    if (best === null || v < best) best = v;
+  });
+  return best;
+}
+// Cât are de plătit șoferul pentru săptămânile scadente din luna asta.
+function driverMonthDue(data, ownerId, year, month) {
+  const ranges = weekRanges(year, month);
+  let s = 0;
+  ranges.forEach((r, i) => {
+    if (weekIsDue(year, month, r)) s += driverWeekPlan(data, ownerId, year, month, i, ranges);
+  });
+  return s;
+}
+// Restanța adusă din lunile anterioare (de la prima lună cu înregistrări).
+function driverCarryBefore(data, ownerId, year, month) {
+  const start = firstRecordYM(data);
+  if (start === null) return 0;
+  let bal = 0;
+  for (let v = start; v < year * 12 + month; v++) {
+    const y = Math.floor(v / 12), m = v % 12;
+    bal = Math.max(bal + driverMonthDue(data, ownerId, y, m) - monthlyPaid(data, y, m, ownerId), 0);
+  }
+  return bal;
+}
+// Restanța totală a șoferului la sfârșitul lunii date (doar săptămâni scadente).
+function driverBal(data, ownerId, year, month) {
+  const carry = driverCarryBefore(data, ownerId, year, month);
+  return Math.max(carry + driverMonthDue(data, ownerId, year, month) - monthlyPaid(data, year, month, ownerId), 0);
 }
 
 // Restanța unui șofer nu trebuie să dispară doar pentru că nu mai conduce
-// nicio mașină acum (a fost mutat pe alta, sau a plecat). Funcția asta
-// adună restanțele rămase din toate înregistrările lui, indiferent de lună.
+// nicio mașină acum (a fost mutat pe alta, sau a plecat).
 function driverDebtsWithoutCar(data) {
-  const assignedDriverIds = new Set(data.cars.filter((c) => c.driverId).map((c) => c.driverId));
-  const byDriver = new Map(); // driverId -> total restanță
-  Object.values(data.weeklyPayments || {}).forEach((rec) => {
-    if (!rec) return;
-    const driverId = rec.driverId;
-    if (!driverId || assignedDriverIds.has(driverId)) return;
-    const driver = data.drivers.find((d) => d.id === driverId);
-    if (!driver) return;
-    const car = data.cars.find((c) => c.id === rec.carId);
-    if (!car) return;
-    const ranges = weekRanges(rec.year, rec.month);
-    const due = weekPlan(data, car, rec.year, rec.month, rec.weekIdx, ranges);
-    const paid = Number(rec.paidAmount || 0);
-    const rest = Math.max(due - paid, 0);
-    if (!rest) return;
-    byDriver.set(driverId, (byDriver.get(driverId) || 0) + rest);
-  });
-  return Array.from(byDriver.entries())
-    .map(([driverId, rest]) => ({ driver: data.drivers.find((d) => d.id === driverId), rest }))
-    .filter((r) => r.driver && r.rest > 0)
+  const now = nowMoldova();
+  const assigned = new Set(data.cars.filter((c) => c.driverId).map((c) => c.driverId));
+  return data.drivers
+    .filter((d) => !assigned.has(d.id))
+    .map((d) => ({ driver: d, rest: driverBal(data, d.id, now.getFullYear(), now.getMonth()) }))
+    .filter((r) => r.rest > 0)
     .sort((a, b) => b.rest - a.rest);
 }
 
 const DAY_NAMES_RO = ["Duminică", "Luni", "Marți", "Miercuri", "Joi", "Vineri", "Sâmbătă"];
-// Duminica apare mereu în calendar (ca să poți nota dacă a lucrat/a adus bani),
-// dar NU intră automat în planul/calculul zilelor lucrate — doar dacă bifezi
-// explicit "Numără în plan" pe rândul ei (vezi DayRow + workingDaysEffective).
+// Toate zilele săptămânii apar în calendar (ca să poți nnota dacă a lucrat/a
+// adus bani), dar zilele libere ale mașinii (duminica, sau sâmbăta la 5 zile)
+// NU intră automat în plan — doar dacă bifezi "Numără în plan" pe rândul lor.
 function weekDays(car, year, month, weekIdx, ranges) {
   const r = ranges[weekIdx];
   const days = [];
   for (let d = r.start; d <= r.end; d++) {
-    if (isCarWorkDay(car, year, month, d)) days.push(d);
-    else if (isSunday(year, month, d)) days.push(d);
+    days.push(d);
   }
   return days;
 }
@@ -432,21 +502,20 @@ export default function TaxiFleetPro() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Migrare unică: restanțele care erau legate de mașină trec pe șoferul
-  // care conduce acum acea mașină. Rulează o singură dată (flag
-  // debtMigratedToDrivers) și salvează imediat rezultatul.
-  // Siguranță în plus: dacă nu există nicio mașină/șofer/plată (adică
-  // "datele" arată suspect de goale), NU trimitem nimic pe server — punem
-  // doar flag-ul local. Așa, chiar dacă apare vreun bug de încărcare pe
-  // viitor, nu mai poate scrie automat un stat gol peste date reale.
+  // Migrări unice (într-un singur efect, ca să nu se calce una pe alta):
+  // 1) restanțele legate de mașină trec pe șoferul care conduce acum mașina;
+  // 2) se creează istoricul de alocări șofer–mașină.
+  // Fiecare e ferită de rulare dublă prin flag-ul ei. Siguranță în plus: dacă
+  // datele arată suspect de goale, NU trimitem nimic pe server — punem doar
+  // flag-urile local, ca să nu se poată scrie automat un stat gol peste date reale.
   useEffect(() => {
-    if (!data || data.debtMigratedToDrivers) return;
+    if (!data || (data.debtMigratedToDrivers && data.assignmentsMigrated)) return;
     const looksEmpty = (!data.cars || !data.cars.length) && (!data.drivers || !data.drivers.length) && !Object.keys(data.weeklyPayments || {}).length;
     if (looksEmpty) {
-      setData((prev) => ({ ...prev, debtMigratedToDrivers: true }));
+      setData((prev) => ({ ...prev, debtMigratedToDrivers: true, assignmentsMigrated: true }));
       return;
     }
-    const migrated = migrateDebtToDrivers(data);
+    const migrated = migrateAssignments(migrateDebtToDrivers(data));
     setData(migrated);
     persist(migrated);
   }, [data, persist]);
@@ -693,17 +762,19 @@ function Dashboard({ data, setTab }) {
   const inService = data.cars.filter((c) => c.status === "service").length;
 
   const weekRows = data.cars.map((c) => {
-    const rec = weeklyRecord(data, year, month, debtOwnerId(c), wIdx);
-    const due = weekPlan(data, c, year, month, wIdx, ranges);
+    const owner = weekOwnerId(data, c, year, month, wIdx, ranges);
+    const rec = weeklyRecord(data, year, month, owner, wIdx);
+    const due = driverWeekPlan(data, owner, year, month, wIdx, ranges);
     const paid = rec ? rec.paidAmount : null;
-    return { car: c, due, paid, status: statusOf(due, paid) };
+    const bal = c.driverId ? driverBal(data, c.driverId, year, month) : 0;
+    return { car: c, due, paid, bal, status: weekStatus(due, paid, year, month, range) };
   });
   const incomeWeek = weekRows.reduce((s, r) => s + (r.paid || 0), 0);
   const expensesWeek = data.expenses
     .filter((e) => e.data && e.data.startsWith(monthKey(year, month)) && Number(e.data.slice(8, 10)) >= range.start && Number(e.data.slice(8, 10)) <= range.end)
     .reduce((s, e) => s + Number(e.suma || 0), 0);
   const profitWeek = incomeWeek - expensesWeek;
-  const problemCount = weekRows.filter((r) => r.status === "unpaid" || r.status === "partial").length;
+  const problemCount = weekRows.filter((r) => r.bal > 0).length;
 
   const insuranceAlerts = data.insurances.filter((ins) => { const d = daysUntil(ins.dataExpirare); return d != null && d <= 30; });
   const inspectionAlerts = data.inspections.filter((insp) => { const d = daysUntil(insp.dataExpirare); return d != null && d <= 30; });
@@ -721,11 +792,10 @@ function Dashboard({ data, setTab }) {
     return { cash, card };
   })();
 
-  const todayRanges = weekRanges(year, month);
-  const todayWeekIdx = currentWeekIndex(year, month, day, todayRanges);
   const carsWithDriver = data.cars.filter((c) => c.driverId && isCarActive(c));
   const missingTodayCount = carsWithDriver.filter((c) => {
-    const rec = weeklyRecord(data, year, month, debtOwnerId(c), todayWeekIdx);
+    const owner = ownerOnDay(data, c, year, month, day);
+    const rec = weeklyRecord(data, year, month, owner, wIdx);
     const dayRec = rec && rec.dailyAmounts ? rec.dailyAmounts[day] : null;
     return !dayRec;
   }).length;
@@ -736,6 +806,8 @@ function Dashboard({ data, setTab }) {
     { label: "Cash adus azi", value: fmtMoney(cashCardToday.cash), icon: Wallet, sub: todayISO(), mono: true },
     { label: "Card adus azi", value: fmtMoney(cashCardToday.card), icon: TrendingUp, sub: todayISO(), mono: true, accent: true },
   ];
+
+  const visibleRows = weekRows.filter((r) => r.due > 0 || r.bal > 0);
 
   return (
     <div>
@@ -762,7 +834,7 @@ function Dashboard({ data, setTab }) {
       {problemCount > 0 && (
         <div className="card" style={{ borderColor: "#e5484d55", marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
           <AlertTriangle size={17} color="var(--red)" />
-          <div style={{ fontSize: 13.5 }}>{problemCount} mașin{problemCount === 1 ? "ă are" : "i au"} restanță în săptămâna asta.</div>
+          <div style={{ fontSize: 13.5 }}>{problemCount} mașin{problemCount === 1 ? "ă are" : "i au"} restanță din săptămâni încheiate (plata nu a venit în {GRACE_DAYS} zile după sfârșitul săptămânii).</div>
           <button className="btn" style={{ marginLeft: "auto" }} onClick={() => setTab("calendar")}>Deschide calendar</button>
         </div>
       )}
@@ -784,13 +856,13 @@ function Dashboard({ data, setTab }) {
       <div className="card">
         <div style={{ fontWeight: 700, marginBottom: 4 }} className="disp">Săptămâna aceasta, pe mașini</div>
         <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 10 }}>{range.start}–{range.end} {MONTHS_RO[month]}</div>
-        {weekRows.filter((r) => r.due > 0).length === 0 ? (
+        {visibleRows.length === 0 ? (
           <EmptyState text="Niciun tarif zilnic setat încă la mașinile tale — adaugă tarife în secțiunea Mașini ca să apară aici planul săptămânal de chirie." />
         ) : (
           <table>
-            <thead><tr><th>Mașină</th><th>Șofer</th><th>Plan săpt.</th><th>Adus</th><th>Stare</th></tr></thead>
+            <thead><tr><th>Mașină</th><th>Șofer</th><th>Plan săpt.</th><th>Adus</th><th>Restanță</th><th>Stare</th></tr></thead>
             <tbody>
-              {weekRows.filter((r) => r.due > 0).map(({ car, status, due, paid }) => {
+              {visibleRows.map(({ car, status, due, paid, bal }) => {
                 const driver = data.drivers.find((d) => d.id === car.driverId);
                 return (
                   <tr key={car.id}>
@@ -798,7 +870,8 @@ function Dashboard({ data, setTab }) {
                     <td>{driver ? driver.nume : <span style={{ color: "var(--muted)" }}>—</span>}</td>
                     <td className="mono">{fmtMoney(due)}</td>
                     <td className="mono">{paid == null ? "—" : fmtMoney(paid)}</td>
-                    <td><StatusPill status={status} restanta={due - (paid || 0)} /></td>
+                    <td className="mono" style={{ color: bal > 0 ? "var(--orange)" : "var(--muted)", fontWeight: bal > 0 ? 700 : 400 }}>{bal > 0 ? fmtMoney(bal) : "—"}</td>
+                    <td><StatusPill status={status} restanta={Math.max(due - (paid || 0), 0)} /></td>
                   </tr>
                 );
               })}
@@ -814,9 +887,9 @@ function Dashboard({ data, setTab }) {
 function StatusPill({ status, restanta }) {
   const map = {
     paid: { label: "Plan îndeplinit", bg: "#2bb67322", color: "var(--green)" },
-    unpaid: { label: "Neachitat", bg: "#e5484d22", color: "var(--red)" },
+    unpaid: { label: restanta > 0 ? `Restanță ${fmtMoney(restanta)}` : "Restanță", bg: "#e5484d22", color: "var(--red)" },
     partial: { label: `Mai are ${fmtMoney(restanta)}`, bg: "#f2841c22", color: "var(--orange)" },
-    pending: { label: "Așteptăm", bg: "#f2b70522", color: "var(--amber)" },
+    pending: { label: "Așteptăm plata", bg: "#f2b70522", color: "var(--amber)" },
   };
   const m = map[status] || map.pending;
   return <span className="pill" style={{ background: m.bg, color: m.color }}>{m.label}</span>;
@@ -855,14 +928,40 @@ function CarsView({ data, update }) {
     [data.cars]
   );
 
+  // Dacă se schimbă șoferul, notăm în istoric DE CÂND, ca zilele de dinainte
+  // (și restanța lor) să rămână la șoferul vechi.
   const save = (car) => {
     update((prev) => {
-      const cars = car.id ? prev.cars.map((c) => (c.id === car.id ? car : c)) : [...prev.cars, { ...car, id: uid() }];
-      return { ...prev, cars };
+      const changeDate = car.driverChangeDate || todayISO();
+      const { driverChangeDate, ...clean } = car;
+      let assignments = prev.assignments || [];
+      let cars;
+      if (clean.id) {
+        const old = prev.cars.find((c) => c.id === clean.id);
+        const oldDriver = old ? old.driverId || "" : "";
+        const newDriver = clean.driverId || "";
+        if (oldDriver !== newDriver) {
+          const hasAny = assignments.some((a) => a.carId === clean.id);
+          if (!hasAny && oldDriver) {
+            assignments = [...assignments, { id: uid(), carId: clean.id, driverId: oldDriver, from: initialAssignmentFrom(prev, old) }];
+          }
+          assignments = [...assignments, { id: uid(), carId: clean.id, driverId: newDriver, from: changeDate }];
+        }
+        cars = prev.cars.map((c) => (c.id === clean.id ? clean : c));
+      } else {
+        const newId = uid();
+        if (clean.driverId) assignments = [...assignments, { id: uid(), carId: newId, driverId: clean.driverId, from: changeDate }];
+        cars = [...prev.cars, { ...clean, id: newId }];
+      }
+      return { ...prev, cars, assignments };
     });
     setEditing(null);
   };
-  const remove = (id) => update((prev) => ({ ...prev, cars: prev.cars.filter((c) => c.id !== id) }));
+  const remove = (id) => update((prev) => ({
+    ...prev,
+    cars: prev.cars.filter((c) => c.id !== id),
+    assignments: (prev.assignments || []).filter((a) => a.carId !== id),
+  }));
 
   return (
     <div>
@@ -935,8 +1034,9 @@ function CarStatusPill({ status }) {
 }
 
 function CarForm({ car, drivers, onSave, onCancel }) {
-  const [f, setF] = useState(car);
+  const [f, setF] = useState(() => ({ ...car, driverChangeDate: todayISO() }));
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const driverChanged = (f.driverId || "") !== (car.driverId || "");
   return (
     <div>
       <div className="field"><label>Număr înmatriculare</label><input value={f.nr} onChange={(e) => set("nr", e.target.value)} placeholder="EWM 110" /></div>
@@ -973,6 +1073,15 @@ function CarForm({ car, drivers, onSave, onCancel }) {
           {drivers.map((d) => <option key={d.id} value={d.id}>{d.nume}</option>)}
         </select>
       </div>
+      {driverChanged && (
+        <div className="field">
+          <label>{f.driverId ? "Conduce de la data" : "Nu mai conduce de la data"}</label>
+          <input type="date" value={f.driverChangeDate || ""} onChange={(e) => set("driverChangeDate", e.target.value)} />
+          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
+            Zilele dinainte de această dată (și restanța lor) rămân la șoferul vechi; de la ea contează noul șofer.
+          </div>
+        </div>
+      )}
       <div className="field">
         <label>Status</label>
         <select value={f.status} onChange={(e) => set("status", e.target.value)}>
@@ -1068,11 +1177,20 @@ function DriversView({ data, update }) {
     setEditing(null);
   };
   const remove = (id) => {
-    update((prev) => ({
-      ...prev,
-      drivers: prev.drivers.filter((d) => d.id !== id),
-      cars: prev.cars.map((c) => (c.driverId === id ? { ...c, driverId: "" } : c)),
-    }));
+    update((prev) => {
+      // Mașinile lui rămân fără șofer de azi încolo (în istoric notăm asta).
+      const freed = prev.cars.filter((c) => c.driverId === id);
+      const assignments = [
+        ...(prev.assignments || []),
+        ...freed.map((c) => ({ id: uid(), carId: c.id, driverId: "", from: todayISO() })),
+      ];
+      return {
+        ...prev,
+        drivers: prev.drivers.filter((d) => d.id !== id),
+        cars: prev.cars.map((c) => (c.driverId === id ? { ...c, driverId: "" } : c)),
+        assignments,
+      };
+    });
   };
 
   return (
@@ -1170,28 +1288,34 @@ function WeeklyCalendarView({ data, update }) {
     setMonth(m); setYear(y);
   };
 
+  const driverIdOf = (prev, owner) => (prev.drivers.some((d) => d.id === owner) ? owner : null);
+
   const setWeekTotal = (car, weekIdx, cash, card) => {
-    const k = weekKey(year, month, debtOwnerId(car), weekIdx);
     const paidAmount = Number(cash || 0) + Number(card || 0);
-    update((prev) => ({
-      ...prev,
-      weeklyPayments: {
-        ...prev.weeklyPayments,
-        [k]: { ...(prev.weeklyPayments[k] || {}), year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "total", paidCash: Number(cash || 0), paidCard: Number(card || 0), paidAmount },
-      },
-    }));
+    update((prev) => {
+      const owner = weekOwnerId(prev, car, year, month, weekIdx, ranges);
+      const k = weekKey(year, month, owner, weekIdx);
+      return {
+        ...prev,
+        weeklyPayments: {
+          ...prev.weeklyPayments,
+          [k]: { ...(prev.weeklyPayments[k] || {}), year, month, carId: car.id, driverId: driverIdOf(prev, owner), weekIdx, mode: "total", paidCash: Number(cash || 0), paidCard: Number(card || 0), paidAmount },
+        },
+      };
+    });
   };
 
   const setWeekMode = (car, weekIdx, mode) => {
-    const k = weekKey(year, month, debtOwnerId(car), weekIdx);
     update((prev) => {
+      const owner = weekOwnerId(prev, car, year, month, weekIdx, ranges);
+      const k = weekKey(year, month, owner, weekIdx);
       const existing = prev.weeklyPayments[k];
       let rec;
       if (existing) {
         rec = { ...existing, mode };
         // Dacă trecem de pe "Total" pe "Pe zile" și suma totală introdusă anterior
-        // nu are încă nicio zi detaliată, o punem automat pe prima zi lucrătoare
-        // din săptămână, ca banii introduși deja să nu dispară din vizualizarea pe zile.
+        // nu are încă nicio zi detaliată, o punem automat pe prima zi din
+        // săptămână, ca banii introduși deja să nu dispară din vizualizarea pe zile.
         if (mode === "daily" && existing.mode !== "daily") {
           const hasDaily = existing.dailyAmounts && Object.keys(existing.dailyAmounts).length > 0;
           const hasTotal = Number(existing.paidCash || 0) > 0 || Number(existing.paidCard || 0) > 0;
@@ -1211,16 +1335,19 @@ function WeeklyCalendarView({ data, update }) {
           }
         }
       } else {
-        rec = { year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode, paidCash: 0, paidCard: 0, paidAmount: 0, dailyAmounts: {} };
+        rec = { year, month, carId: car.id, driverId: driverIdOf(prev, owner), weekIdx, mode, paidCash: 0, paidCard: 0, paidAmount: 0, dailyAmounts: {} };
       }
       return { ...prev, weeklyPayments: { ...prev.weeklyPayments, [k]: rec } };
     });
   };
 
   const setWeekDay = (car, weekIdx, day, entry) => {
-    const k = weekKey(year, month, debtOwnerId(car), weekIdx);
     update((prev) => {
-      const existing = prev.weeklyPayments[k] || { year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "daily", paidCash: 0, paidCard: 0, paidAmount: 0, dailyAmounts: {} };
+      // Ziua aparține șoferului care conducea mașina în ziua aceea.
+      const owner = ownerOnDay(prev, car, year, month, day);
+      const ownerDriver = driverIdOf(prev, owner);
+      const k = weekKey(year, month, owner, weekIdx);
+      const existing = prev.weeklyPayments[k] || { year, month, carId: car.id, driverId: ownerDriver, weekIdx, mode: "daily", paidCash: 0, paidCard: 0, paidAmount: 0, dailyAmounts: {} };
       const prevDay = (existing.dailyAmounts || {})[day] || {};
       const merged = { worked: true, cash: 0, card: 0, note: "", ...prevDay, ...entry };
       if (!merged.worked) { merged.cash = 0; merged.card = 0; }
@@ -1228,7 +1355,7 @@ function WeeklyCalendarView({ data, update }) {
       const paidCash = Object.values(dailyAmounts).reduce((s, d) => s + (d.worked === false ? 0 : Number(d.cash || 0)), 0);
       const paidCard = Object.values(dailyAmounts).reduce((s, d) => s + (d.worked === false ? 0 : Number(d.card || 0)), 0);
       const paidAmount = paidCash + paidCard;
-      const rec = { ...existing, year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "daily", dailyAmounts, paidCash, paidCard, paidAmount };
+      const rec = { ...existing, year, month, carId: car.id, driverId: ownerDriver, weekIdx, mode: "daily", dailyAmounts, paidCash, paidCard, paidAmount };
       return { ...prev, weeklyPayments: { ...prev.weeklyPayments, [k]: rec } };
     });
   };
@@ -1259,7 +1386,7 @@ function WeeklyCalendarView({ data, update }) {
         <button className="btn" style={{ padding: 8 }} onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
       </div>
 
-<div className="field" style={{ marginBottom: 10 }}>
+      <div className="field" style={{ marginBottom: 10 }}>
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Caută mașină după număr, marcă sau model…" />
       </div>
 
@@ -1302,11 +1429,12 @@ function WeeklyCalendarView({ data, update }) {
 }
 
 function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expanded, onToggle, onSetWeekTotal, onSetWeekMode, onSetWeekDay, onSetStartDate, onSetStatus }) {
-  const carryover = carryoverFromPrevMonth(data, car, year, month);
-  const planTotal = monthlyPlanWithCarry(data, car, year, month);
-  const paidTotal = monthlyPaid(data, year, month, debtOwnerId(car));
-  const restTotal = Math.max(planTotal - paidTotal, 0);
-  const rowStatus = restTotal <= 0 ? "paid" : paidTotal > 0 ? "partial" : "unpaid";
+  const ownerNow = debtOwnerId(car);
+  const weekOwners = ranges.map((_, i) => weekOwnerId(data, car, year, month, i, ranges));
+  const planTotal = ranges.reduce((s, _, i) => s + driverWeekPlan(data, weekOwners[i], year, month, i, ranges), 0);
+  const paidTotal = ranges.reduce((s, _, i) => s + weeklyPaid(data, year, month, weekOwners[i], i), 0);
+  const bal = driverBal(data, ownerNow, year, month);
+  const rowStatus = bal > 0 ? (paidTotal <= 0 ? "unpaid" : "partial") : planTotal > paidTotal ? "pending" : "paid";
   const [editingStart, setEditingStart] = useState(false);
   const [startVal, setStartVal] = useState(car.startDate || `${year}-${String(month + 1).padStart(2, "0")}-01`);
 
@@ -1341,7 +1469,7 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-          {isCarActive(car) ? <StatusPill status={rowStatus} restanta={restTotal} /> : <CarStatusPill status={car.status} />}
+          {isCarActive(car) ? <StatusPill status={rowStatus} restanta={bal} /> : <CarStatusPill status={car.status} />}
           <div style={{ textAlign: "right" }}>
             <div style={{ fontSize: 10.5, color: "var(--muted)" }}>Plan lună</div>
             <div className="mono" style={{ fontWeight: 700, fontSize: 13.5 }}>{isCarActive(car) ? fmtMoney(planTotal) : "—"}</div>
@@ -1398,9 +1526,9 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
 
       {expanded && (
         <div style={{ padding: "0 16px 16px" }}>
-          {carryover > 0 && (
+          {bal > 0 && (
             <div style={{ fontSize: 12, color: "var(--orange)", marginBottom: 8, display: "flex", alignItems: "center", gap: 5 }}>
-              <AlertTriangle size={13} /> din care {fmtMoney(carryover)} restanță din luna trecută
+              <AlertTriangle size={13} /> Restanță acumulată {fmtMoney(bal)} (doar din săptămâni încheiate, neachitate)
             </div>
           )}
 
@@ -1410,14 +1538,14 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
                 key={i} car={car} data={data} year={year} month={month} weekIdx={i} range={r} ranges={ranges} isCurrent={i === todayIdx}
                 onSetTotal={(cash, card) => onSetWeekTotal(i, cash, card)}
                 onSetMode={(mode) => onSetWeekMode(i, mode)}
-                onSetDay={(day, cash, card) => onSetWeekDay(i, day, cash, card)}
+                onSetDay={(day, entry) => onSetWeekDay(i, day, entry)}
               />
             ))}
           </div>
 
           <div style={{ display: "flex", gap: 16, fontSize: 12.5, borderTop: "1px solid var(--border)", paddingTop: 8, flexWrap: "wrap" }}>
-            <div>Adus: <span className="mono" style={{ color: "var(--green)", fontWeight: 700 }}>{fmtMoney(paidTotal)}</span></div>
-            <div>Rest: <span className="mono" style={{ color: restTotal > 0 ? "var(--orange)" : "var(--muted)", fontWeight: 700 }}>{fmtMoney(restTotal)}</span></div>
+            <div>Adus luna asta: <span className="mono" style={{ color: "var(--green)", fontWeight: 700 }}>{fmtMoney(paidTotal)}</span></div>
+            <div>Restanță: <span className="mono" style={{ color: bal > 0 ? "var(--orange)" : "var(--muted)", fontWeight: 700 }}>{fmtMoney(bal)}</span></div>
           </div>
         </div>
       )}
@@ -1426,8 +1554,9 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
 }
 
 function WeekRow({ car, data, year, month, weekIdx, range, ranges, isCurrent, onSetTotal, onSetMode, onSetDay }) {
-  const rec = weeklyRecord(data, year, month, debtOwnerId(car), weekIdx);
-  const plan = weekPlan(data, car, year, month, weekIdx, weekRanges(year, month));
+  const owner = weekOwnerId(data, car, year, month, weekIdx, ranges);
+  const rec = weeklyRecord(data, year, month, owner, weekIdx);
+  const plan = driverWeekPlan(data, owner, year, month, weekIdx, ranges);
   const mode = rec && rec.mode === "daily" ? "daily" : "total";
   const [cash, setCash] = useState(rec ? rec.paidCash : "");
   const [card, setCard] = useState(rec ? rec.paidCard : "");
@@ -1436,10 +1565,10 @@ function WeekRow({ car, data, year, month, weekIdx, range, ranges, isCurrent, on
     setCash(rec ? rec.paidCash : "");
     setCard(rec ? rec.paidCard : "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [year, month, weekIdx, mode]);
+  }, [year, month, weekIdx, mode, owner]);
 
   const paid = rec ? rec.paidAmount : null;
-  const status = statusOf(plan, paid);
+  const status = weekStatus(plan, paid, year, month, range);
   const colors = { paid: "var(--green)", unpaid: "var(--red)", partial: "var(--orange)", pending: "var(--muted)" };
   const rest = Math.max(plan - (paid || 0), 0);
 
@@ -1455,7 +1584,7 @@ function WeekRow({ car, data, year, month, weekIdx, range, ranges, isCurrent, on
             {isCurrent && <span className="pill" style={{ background: "#f2b70522", color: "var(--amber)" }}>curentă</span>}
           </div>
           <div style={{ fontSize: 11.5, color: colors[status] }}>
-            Plan {fmtMoney(plan)}{paid != null ? ` · adus ${fmtMoney(paid)}` : ""}{status === "partial" ? ` · mai are ${fmtMoney(rest)}` : ""}
+            Plan {fmtMoney(plan)}{paid != null ? ` · adus ${fmtMoney(paid)}` : ""}{status === "partial" ? ` · mai are ${fmtMoney(rest)}` : ""}{status === "pending" && plan > 0 ? " · se așteaptă plata" : ""}
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1463,7 +1592,7 @@ function WeekRow({ car, data, year, month, weekIdx, range, ranges, isCurrent, on
             <button type="button" className={mode === "total" ? "active" : ""} onClick={() => onSetMode("total")}>Total</button>
             <button type="button" className={mode === "daily" ? "active" : ""} onClick={() => onSetMode("daily")}>Pe zile</button>
           </div>
-          <StatusPill status={status} restanta={rest} />
+          {(plan > 0 || paid != null) && <StatusPill status={status} restanta={rest} />}
         </div>
       </div>
 
@@ -1478,9 +1607,11 @@ function WeekRow({ car, data, year, month, weekIdx, range, ranges, isCurrent, on
         </div>
       ) : (
         <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
-          {days.map((day) => (
-            <DayRow key={day} car={car} year={year} month={month} day={day} rec={rec} onSetDay={onSetDay} />
-          ))}
+          {days.map((day) => {
+            const dayOwner = ownerOnDay(data, car, year, month, day);
+            const dayRec = weeklyRecord(data, year, month, dayOwner, weekIdx);
+            return <DayRow key={`${day}-${dayOwner}`} car={car} year={year} month={month} day={day} rec={dayRec} onSetDay={onSetDay} />;
+          })}
         </div>
       )}
     </div>
@@ -1508,9 +1639,10 @@ function DayRow({ car, year, month, day, rec, onSetDay }) {
     else onSetDay(day, { worked: false, note });
   };
 
-  // Duminica e afișată mereu, dar nu e o zi lucrătoare "normală" a mașinii —
-  // implicit nu intră în planul săptămânii; aici poți bifa explicit s-o incluzi.
-  const isExtraSunday = isSunday(year, month, day) && !isCarWorkDay(car, year, month, day);
+  // Zilele libere ale mașinii (duminica, sau sâmbăta la 5 zile/săpt) sunt
+  // afișate mereu, dar nu intră implicit în planul săptămânii; aici poți bifa
+  // explicit să le incluzi.
+  const isExtraDay = !isCarWorkDay(car, year, month, day);
   const countsInPlan = !!(existing && existing.countsInPlan);
   const toggleCountsInPlan = (next) => onSetDay(day, { countsInPlan: next });
 
@@ -1524,8 +1656,8 @@ function DayRow({ car, year, month, day, rec, onSetDay }) {
           <button type="button" className={worked ? "active" : ""} onClick={() => toggleWorked(true)}>A lucrat</button>
           <button type="button" className={!worked ? "active" : ""} onClick={() => toggleWorked(false)}>Nu a lucrat</button>
         </div>
-        {isExtraSunday && (
-          <div className="modetoggle" title="Implicit duminica nu intră în planul/calculul zilelor lucrate.">
+        {isExtraDay && (
+          <div className="modetoggle" title="Implicit zilele libere nu intră în planul/calculul zilelor lucrate.">
             <button type="button" className={!countsInPlan ? "active" : ""} onClick={() => toggleCountsInPlan(false)}>Nu intră în plan</button>
             <button type="button" className={countsInPlan ? "active" : ""} onClick={() => toggleCountsInPlan(true)}>Numără în plan</button>
           </div>
@@ -1839,12 +1971,8 @@ function FinanceView({ data, update }) {
     .filter((p) => p.year === year && p.month === month)
     .reduce((s, p) => s + Number(p.paidAmount || 0), 0);
 
-const restante = data.cars.reduce((s, car) => {
-  if (!car.driverId) return s; // doar mașini cu șofer alocat momentan
-  const plan = monthlyPlanBase(data, car, year, month); // fără moștenire din lunile trecute — pornește curat, de azi
-  const paid = monthlyPaid(data, year, month, debtOwnerId(car));
-  return s + Math.max(plan - paid, 0);
-}, 0);
+  // Restanța pe șoferi (inclusiv cei care nu mai conduc nicio mașină), doar din săptămâni scadente.
+  const restante = data.drivers.reduce((s, drv) => s + driverBal(data, drv.id, year, month), 0);
 
   const dailyBreakdown = useMemo(() => {
     const map = {};
@@ -2123,9 +2251,12 @@ function EarningsView({ data, update }) {
   }, [data.cars, data.drivers]);
 
   const setDay = (car, entry) => {
-    const k = weekKey(year, month, debtOwnerId(car), weekIdx);
     update((prev) => {
-      const existing = prev.weeklyPayments[k] || { year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "daily", paidCash: 0, paidCard: 0, paidAmount: 0, dailyAmounts: {} };
+      // Încasarea se scrie pe șoferul care conducea mașina în ziua aleasă.
+      const owner = ownerOnDay(prev, car, year, month, day);
+      const ownerDriver = prev.drivers.some((dr) => dr.id === owner) ? owner : null;
+      const k = weekKey(year, month, owner, weekIdx);
+      const existing = prev.weeklyPayments[k] || { year, month, carId: car.id, driverId: ownerDriver, weekIdx, mode: "daily", paidCash: 0, paidCard: 0, paidAmount: 0, dailyAmounts: {} };
       const prevDay = (existing.dailyAmounts || {})[day] || {};
       const merged = { worked: true, cash: 0, card: 0, note: "", ...prevDay, ...entry };
       if (!merged.worked) { merged.cash = 0; merged.card = 0; }
@@ -2133,15 +2264,16 @@ function EarningsView({ data, update }) {
       const paidCash = Object.values(dailyAmounts).reduce((s, dd) => s + (dd.worked === false ? 0 : Number(dd.cash || 0)), 0);
       const paidCard = Object.values(dailyAmounts).reduce((s, dd) => s + (dd.worked === false ? 0 : Number(dd.card || 0)), 0);
       const paidAmount = paidCash + paidCard;
-      const rec = { ...existing, year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "daily", dailyAmounts, paidCash, paidCard, paidAmount };
+      const rec = { ...existing, year, month, carId: car.id, driverId: ownerDriver, weekIdx, mode: "daily", dailyAmounts, paidCash, paidCard, paidAmount };
       return { ...prev, weeklyPayments: { ...prev.weeklyPayments, [k]: rec } };
     });
   };
 
   const rows = cars.map((car) => {
-    const rec = weeklyRecord(data, year, month, debtOwnerId(car), weekIdx);
+    const owner = ownerOnDay(data, car, year, month, day);
+    const rec = weeklyRecord(data, year, month, owner, weekIdx);
     const dayRec = rec && rec.dailyAmounts ? rec.dailyAmounts[day] : null;
-    const driver = data.drivers.find((dd) => dd.id === car.driverId);
+    const driver = data.drivers.find((dd) => dd.id === owner);
     return { car, driver, dayRec };
   });
 
@@ -2227,7 +2359,7 @@ function EarningsView({ data, update }) {
                 const worked = dayRec ? dayRec.worked !== false : true;
                 return (
                   <EarningsRow
-                    key={`${date}-${car.id}`}
+                    key={`${date}-${car.id}-${driver ? driver.id : "x"}`}
                     car={car} driver={driver} dayRec={dayRec} worked={worked}
                     onCommit={(entry) => setDay(car, entry)}
                     onToggleWorked={(w) => setDay(car, { worked: w })}
@@ -2303,14 +2435,17 @@ function ReportsView({ data }) {
   const [search, setSearch] = useState("");
 
   const perCar = useMemo(() => {
+    const ranges = weekRanges(year, month);
     const rows = data.cars.filter((car) => car.driverId).map((car) => {
-      const planBase = monthlyPlanBase(data, car, year, month);
-      const plan = monthlyPlanWithCarry(data, car, year, month);
-      const paid = monthlyPaid(data, year, month, debtOwnerId(car));
-      const carryover = carryoverFromPrevMonth(data, car, year, month);
-      const driver = data.drivers.find((d) => d.id === car.driverId);
-      const rest = Math.max(plan - paid, 0);
-      const status = statusOf(plan, paid);
+      const owner = car.driverId;
+      const planBase = ranges.reduce((s, _, i) => s + driverWeekPlan(data, owner, year, month, i, ranges), 0);
+      const carryover = driverCarryBefore(data, owner, year, month);
+      const plan = planBase + carryover;
+      const paid = monthlyPaid(data, year, month, owner);
+      const due = driverMonthDue(data, owner, year, month);
+      const rest = Math.max(carryover + due - paid, 0);
+      const driver = data.drivers.find((d) => d.id === owner);
+      const status = rest > 0 ? (paid <= 0 ? "unpaid" : "partial") : plan > paid ? "pending" : "paid";
       return { car, driver, planBase, plan, paid, rest, carryover, status };
     });
     // Restanțele mai mari primele, ca să vezi imediat ce trebuie urmărit.
@@ -2362,7 +2497,7 @@ function ReportsView({ data }) {
         <MiniStat label="Restanțe total" value={fmtMoney(totals.rest)} color={totals.rest > 0 ? "var(--orange)" : "var(--muted)"} />
       </div>
       <div style={{ fontSize: 11.5, color: "var(--muted)", marginBottom: 18 }}>
-        „Total de recuperat" = chiria lunii curente + orice restanță neachitată din lunile anterioare, adunată automat.
+        „Total de recuperat" = planul lunii (până azi) + restanța veche. „Restanță" se numără doar pentru săptămâni încheiate de mai bine de {GRACE_DAYS} zile; până atunci apare „Așteptăm plata".
       </div>
 
       {orphanDebts.length > 0 && (
@@ -2423,7 +2558,7 @@ function ReportsView({ data }) {
           ) : (
             <div className="card" style={{ overflowX: "auto" }}>
               <table>
-                <thead><tr><th>Mașină</th><th>Șofer</th><th>Total de recuperat</th><th>Adus</th><th>Rest</th><th>Stare</th></tr></thead>
+                <thead><tr><th>Mașină</th><th>Șofer</th><th>Total de recuperat</th><th>Adus</th><th>Restanță</th><th>Stare</th></tr></thead>
                 <tbody>
                   {filteredCars.map(({ car, driver, planBase, plan, paid, rest, carryover, status }) => (
                     <tr key={car.id} style={rest > 0 ? { boxShadow: "inset 3px 0 0 var(--orange)" } : undefined}>

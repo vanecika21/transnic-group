@@ -1,23 +1,16 @@
 import { supabase } from "../../../lib/supabase";
 
-/**
- * Ruta de backup. Poate fi apelată în 2 moduri:
- *  1) automat, de Vercel Cron (vezi vercel.json), care trimite
- *     Authorization: Bearer <CRON_SECRET>
- *  2) manual, de tine, din Console, cu același header, ca test.
- *
- * Copiază tot rândul curent "main" din fleet_data într-un rând nou
- * în fleet_data_daily_backups, cu data/ora exactă a salvării.
- */
-export async function GET(request) {
-  const authHeader = request.headers.get("authorization") || "";
-  const expected = `Bearer ${process.env.CRON_SECRET}`;
+// Cron zilnic Vercel: salvează o copie completă a datelor în fleet_data_daily_backups.
+// Locul în proiect: app/api/backup/route.js
+export const dynamic = "force-dynamic";
 
-  if (!process.env.CRON_SECRET || authHeader !== expected) {
-    return Response.json({ error: "Neautorizat." }, { status: 401 });
+export async function GET(request) {
+  const secret = process.env.CRON_SECRET;
+  const auth = request.headers.get("authorization");
+  if (!secret || auth !== `Bearer ${secret}`) {
+    return Response.json({ error: "Neautorizat" }, { status: 401 });
   }
 
-  // 1) citește starea curentă din fleet_data (id = "main")
   const { data: row, error: readError } = await supabase
     .from("fleet_data")
     .select("data")
@@ -28,15 +21,33 @@ export async function GET(request) {
     return Response.json({ error: readError.message }, { status: 500 });
   }
 
-  // 2) scrie o copie nouă în fleet_data_daily_backups
-  const savedAt = new Date().toISOString();
-  const { error: writeError } = await supabase
-    .from("fleet_data_daily_backups")
-    .insert({ data: row ? row.data : null, saved_at: savedAt });
+  const data = row?.data;
+  const hasData =
+    data &&
+    ((Array.isArray(data.cars) && data.cars.length) ||
+      (Array.isArray(data.drivers) && data.drivers.length));
 
-  if (writeError) {
-    return Response.json({ error: writeError.message }, { status: 500 });
+  // Nu salvăm backup dintr-o stare goală, ca să nu acoperim un backup bun.
+  if (!hasData) {
+    return Response.json(
+      { error: "Datele par goale, backup sărit." },
+      { status: 409 }
+    );
   }
 
-  return Response.json({ ok: true, saved_at: savedAt });
+  const today = new Date().toISOString().slice(0, 10);
+
+  const { error } = await supabase
+    .from("fleet_data_daily_backups")
+    .insert({ data });
+
+  if (error) {
+    return Response.json({ error: error.message }, { status: 500 });
+  }
+
+  // Păstrăm ultimele 60 de zile (best-effort).
+  const cutoff = new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString();
+  await supabase.from("fleet_data_daily_backups").delete().lt("saved_at", cutoff);
+
+  return Response.json({ ok: true, date: today });
 }

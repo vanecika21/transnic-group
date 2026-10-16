@@ -33,28 +33,36 @@ export async function POST(request) {
     ((Array.isArray(existing.cars) && existing.cars.length) ||
       (Array.isArray(existing.drivers) && existing.drivers.length));
 
-  // PLASĂ DE SIGURANȚĂ: dacă exista deja o flotă reală (mașini/șoferi) și ce
-  // vine acum la salvare pare complet gol, refuzăm scrierea. Așa nu se mai
-  // poate repeta ștergerea accidentală a tuturor datelor, indiferent de unde
-  // ar veni bug-ul (client vechi, tab uitat deschis, etc.).
+  // PLASĂ 1: nu acceptăm o salvare complet goală peste o flotă existentă.
   if (existingHasData && looksSuspiciouslyEmpty(body)) {
     return Response.json(
       {
         error:
-          "Salvare refuzată: datele trimise nu au nicio mașină și niciun șofer, dar pe server exista deja o flotă. Ca să nu se piardă date din greșeală, scrierea a fost blocată.",
+          "Salvare refuzată: datele trimise nu au nicio mașină și niciun șofer, dar pe server exista deja o flotă.",
       },
       { status: 409 }
     );
   }
 
-  // Istoric: păstrăm o copie a stării DINAINTE de suprascriere, ca să poți
-  // recupera manual din Supabase (tabelul fleet_data_history) dacă vreodată
-  // ceva merge prost. Nu blocăm salvarea dacă asta eșuează.
+  // PLASĂ 2: după migrare, datele au paymentsKeyedByCar = true. O filă/dispozitiv
+  // cu versiunea veche de page.js nu trimite acest semn, deci salvarea lui este
+  // refuzată și nu poate suprascrie datele migrate.
+  if (existing?.paymentsKeyedByCar === true && body?.paymentsKeyedByCar !== true) {
+    return Response.json(
+      {
+        error:
+          "Salvare refuzată: aplicația de pe acest dispozitiv e veche. Reîncarcă pagina (refresh complet).",
+      },
+      { status: 409 }
+    );
+  }
+
+  // Istoric: copie a stării de DINAINTE de suprascriere (best-effort).
   if (existing) {
     try {
       await supabase.from("fleet_data_history").insert({ data: existing });
     } catch {
-      // best-effort — nu oprim salvarea principală din cauza istoricului
+      // nu oprim salvarea principală din cauza istoricului
     }
   }
 

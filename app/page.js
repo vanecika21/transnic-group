@@ -3,7 +3,8 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from "react"
 import {
   Car, Users, Calendar as CalendarIcon, Wallet, BarChart3, Plus, X,
   Trash2, Pencil, Check, AlertTriangle, ChevronLeft, ChevronRight,
-  Phone, Loader2, TrendingUp, TrendingDown, Gauge, Shield, Wrench, Search
+  Phone, Loader2, TrendingUp, TrendingDown, Gauge, Shield, Wrench, Search,
+  Download, Upload
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -13,6 +14,20 @@ import {
    (1-7, 8-14, 15-21, 22-end). Sundays don't count toward the plan.
    If a car doesn't reach its monthly plan, the shortfall is added
    automatically to the next month's plan.
+
+   MODIFICĂRI FĂCUTE (față de versiunea anterioară):
+   - Buton Backup (descarcă JSON) + Restaurează din fișier
+   - Indicator de salvare: "Se salvează… / Salvat / Salvarea a eșuat"
+   - Protecție: nu se trimite niciodată pe server o stare complet goală
+     peste date care existau deja
+   - update() nu mai salvează din interiorul setData (fără salvări duble)
+   - Fonturile se încarcă corect (@import mutat primul în CSS)
+   - Eticheta "Expiră azi" corectă; date în format RO la asigurări/revizii
+   - Dashboard: profit săptămâna, mașinile concrete cu documente care expiră,
+     numărarea mașinilor active cu isCarActive
+   - Cheltuieli: câmp opțional "Mașină" + raport "Profit pe mașină" în Rapoarte
+   - Mesaje de ștergere mai clare (recomandă "Vândută"/"Inactiv")
+   - Esc închide ferestrele, aria-label pe butoanele cu iconiță
 ---------------------------------------------------------------- */
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -405,12 +420,32 @@ function currentWeekIndex(year, month, day, ranges) {
   return idx === -1 ? ranges.length - 1 : idx;
 }
 
+// O stare complet goală (fără mașini, șoferi sau plăți) — folosită ca
+// protecție: nu o trimitem niciodată pe server dacă înainte existau date.
+function isDataEmpty(d) {
+  return !d || (
+    (!d.cars || !d.cars.length) &&
+    (!d.drivers || !d.drivers.length) &&
+    !Object.keys(d.weeklyPayments || {}).length
+  );
+}
+
 export default function TaxiFleetPro() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
-  const [saveError, setSaveError] = useState(false);
+  const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
   const [tab, setTab] = useState("dashboard");
+
+  // dataRef = mereu cea mai recentă stare (chiar și între două randări).
+  // Așa update() nu mai depinde de callback-ul lui setData și nu mai salvează de 2 ori.
+  const dataRef = useRef(null);
+  const hadDataRef = useRef(false);
+  const applyData = useCallback((next) => {
+    dataRef.current = next;
+    if (!isDataEmpty(next)) hadDataRef.current = true;
+    setData(next);
+  }, []);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -424,13 +459,13 @@ export default function TaxiFleetPro() {
       // în tăcere — asta ar risca să fie confundat cu "flotă nouă" și salvat
       // peste datele reale. Doar un răspuns valid (chiar și "niciun rând încă")
       // e tratat ca stare goală legitimă.
-      setData({ ...emptyData(), ...(json ? json.data || {} : {}) });
+      applyData({ ...emptyData(), ...(json ? json.data || {} : {}) });
     } catch {
       setLoadFailed(true);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyData]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -438,13 +473,21 @@ export default function TaxiFleetPro() {
   const savingRef = useRef(false);
 
   const persist = useCallback(async (next) => {
+    // PROTECȚIE: dacă starea de trimis e complet goală, dar înainte existau
+    // date, NU o trimitem — ar șterge totul de pe server.
+    if (isDataEmpty(next) && hadDataRef.current) {
+      setSaveState("error");
+      return;
+    }
     // Ținem minte mereu CEA MAI RECENTĂ stare de trimis. Dacă o cerere e deja
     // în curs, noua stare așteaptă — nu pornim o a doua cerere în paralel.
     // Așa nu mai există risc ca un răspuns "vechi" să ajungă după unul "nou"
     // și să suprascrie date proaspăt introduse (exact bugul din Finanțe).
     pendingSaveRef.current = next;
+    setSaveState("saving");
     if (savingRef.current) return;
     savingRef.current = true;
+    let ok = true;
     while (pendingSaveRef.current) {
       const toSend = pendingSaveRef.current;
       pendingSaveRef.current = null;
@@ -454,21 +497,22 @@ export default function TaxiFleetPro() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(toSend),
         });
-        setSaveError(!res.ok);
+        ok = res.ok;
       } catch {
-        setSaveError(true);
+        ok = false;
       }
     }
     savingRef.current = false;
+    setSaveState(ok ? "saved" : "error");
   }, []);
 
   const update = useCallback((fn) => {
-    setData((prev) => {
-      const next = fn(prev);
-      persist(next);
-      return next;
-    });
-  }, [persist]);
+    const prev = dataRef.current;
+    if (!prev) return;
+    const next = fn(prev);
+    applyData(next);
+    persist(next);
+  }, [applyData, persist]);
 
   // Dacă ții aplicația deschisă simultan pe telefon și pe calculator (sau în
   // mai multe tab-uri), tab-ul rămas mai mult timp în fundal poate avea date
@@ -485,15 +529,16 @@ export default function TaxiFleetPro() {
         if (!res.ok) return;
         const json = await res.json();
         if (!json || !json.data) return;
+        // Dacă între timp a început o salvare, nu suprascriem cu date vechi.
+        if (savingRef.current || pendingSaveRef.current) return;
         const fresh = { ...emptyData(), ...json.data };
         // Nu lăsăm niciodată un răspuns "gol" (fără mașini/șoferi) să
         // înlocuiască date locale care chiar există — mai bine păstrăm ce
         // avem local decât să riscăm să ștergem ceva din greșeală.
         const freshEmpty = (!fresh.cars || !fresh.cars.length) && (!fresh.drivers || !fresh.drivers.length);
-        setData((prev) => {
-          if (freshEmpty && prev && ((prev.cars && prev.cars.length) || (prev.drivers && prev.drivers.length))) return prev;
-          return fresh;
-        });
+        const prev = dataRef.current;
+        if (freshEmpty && prev && ((prev.cars && prev.cars.length) || (prev.drivers && prev.drivers.length))) return;
+        applyData(fresh);
       } catch {
         // conexiune indisponibilă — păstrăm ce avem local
       }
@@ -505,8 +550,7 @@ export default function TaxiFleetPro() {
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisible);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [applyData]);
 
   // Migrare unică: plățile/restanțele trec pe MAȘINĂ (id principal = id mașină).
   // Rulează o singură dată (flag paymentsKeyedByCar), păstrează originalul în
@@ -516,13 +560,46 @@ export default function TaxiFleetPro() {
     if (!data || data.paymentsKeyedByCar) return;
     const looksEmpty = (!data.cars || !data.cars.length) && (!data.drivers || !data.drivers.length) && !Object.keys(data.weeklyPayments || {}).length;
     if (looksEmpty) {
-      setData((prev) => ({ ...prev, paymentsKeyedByCar: true, debtMigratedToDrivers: true }));
+      applyData({ ...data, paymentsKeyedByCar: true, debtMigratedToDrivers: true });
       return;
     }
     const migrated = migrateWeeklyToCar(data);
-    setData(migrated);
+    applyData(migrated);
     persist(migrated);
-  }, [data, persist]);
+  }, [data, persist, applyData]);
+
+  // ---- Backup / Restaurare ----
+  const onBackup = () => {
+    const cur = dataRef.current;
+    if (!cur) return;
+    const blob = new Blob([JSON.stringify(cur, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `taxi-fleet-backup-${todayISO()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const onRestore = async (file) => {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const incoming = parsed && parsed.cars === undefined && parsed.data ? parsed.data : parsed;
+      if (!incoming || !Array.isArray(incoming.cars) || !Array.isArray(incoming.drivers)) throw new Error("format");
+      const ok = window.confirm(
+        `Restaurezi backup-ul? (${incoming.cars.length} mașini, ${incoming.drivers.length} șoferi)\n\n` +
+        "Datele curente vor fi ÎNLOCUITE. Dacă nu ești sigur, apasă Anulează și descarcă mai întâi un backup al datelor de acum."
+      );
+      if (!ok) return;
+      const next = { ...emptyData(), ...incoming };
+      applyData(next);
+      persist(next);
+    } catch {
+      window.alert("Fișierul nu este un backup valid de Taxi Fleet Pro.");
+    }
+  };
 
   if (loadFailed) {
     return (
@@ -549,7 +626,7 @@ export default function TaxiFleetPro() {
   }
 
   return (
-    <Shell tab={tab} setTab={setTab} saveError={saveError}>
+    <Shell tab={tab} setTab={setTab} saveState={saveState} onBackup={onBackup} onRestore={onRestore}>
       {tab === "dashboard" && <Dashboard data={data} setTab={setTab} />}
       {tab === "cars" && <CarsView data={data} update={update} />}
       {tab === "drivers" && <DriversView data={data} update={update} />}
@@ -565,7 +642,39 @@ export default function TaxiFleetPro() {
 
 /* ============================== SHELL ============================== */
 
-function Shell({ tab, setTab, children, loading, saveError }) {
+function SaveBadge({ state }) {
+  if (state === "saving") {
+    return <div style={{ fontSize: 12.5, color: "var(--muted)", display: "flex", alignItems: "center", gap: 5 }}><Loader2 className="spin" size={13} />Se salvează…</div>;
+  }
+  if (state === "error") {
+    return <div className="save-warn"><AlertTriangle size={14} />Salvarea a eșuat</div>;
+  }
+  if (state === "saved") {
+    return <div style={{ fontSize: 12.5, color: "var(--green)", display: "flex", alignItems: "center", gap: 5 }}><Check size={13} />Salvat</div>;
+  }
+  return null;
+}
+
+function BackupControls({ onBackup, onRestore }) {
+  const fileRef = useRef(null);
+  if (!onBackup) return null;
+  return (
+    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+      <button type="button" className="btn" style={{ padding: "6px 10px", fontSize: 12 }} onClick={onBackup} aria-label="Descarcă backup al datelor" title="Descarcă o copie a tuturor datelor">
+        <Download size={13} />Backup
+      </button>
+      <button type="button" className="btn" style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => fileRef.current && fileRef.current.click()} aria-label="Restaurează din backup" title="Restaurează datele dintr-un fișier de backup">
+        <Upload size={13} />Restaurează
+      </button>
+      <input
+        ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
+        onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (f && onRestore) onRestore(f); }}
+      />
+    </div>
+  );
+}
+
+function Shell({ tab, setTab, children, loading, saveState, onBackup, onRestore }) {
   // Anul din footer NU se calculează direct în JSX cu `new Date()`. Dacă am
   // face asta, Shell fiind randat mereu (inclusiv pe ramura de "loading"),
   // orice diferență de moment/fus orar/cache între randarea de pe server și
@@ -606,9 +715,9 @@ function Shell({ tab, setTab, children, loading, saveError }) {
     <div style={{ "--bg": "#14171c", "--panel": "#1c2029", "--amber": "#f2b705", "--orange": "#f2841c", "--green": "#2bb673", "--red": "#e5484d", "--text": "#eae7e0", "--muted": "#8b93a1", "--border": "#2a303b" }}
       className="tfp-root">
       <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
         .tfp-root{background:var(--bg);color:var(--text);min-height:100vh;font-family:'Inter',system-ui,sans-serif;display:flex;flex-direction:row;font-size:14.5px}
         .tfp-root *{box-sizing:border-box}
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
         .disp{font-family:'Space Grotesk',sans-serif}
         .mono{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums}
         .spin{animation:spin 1s linear infinite}
@@ -622,7 +731,7 @@ function Shell({ tab, setTab, children, loading, saveError }) {
         .tfp-group-label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:16px 10px 6px;font-weight:700}
         .tfp-group-label:first-child{padding-top:6px}
         .tfp-sidebar .tfp-navbtn{width:100%;justify-content:flex-start;padding:10px 12px;font-size:14.5px}
-        .tfp-sidebar-foot{padding:14px 18px;border-top:1px solid var(--border);font-size:11.5px;color:var(--muted)}
+        .tfp-sidebar-foot{padding:14px 18px;border-top:1px solid var(--border);font-size:11.5px;color:var(--muted);display:flex;flex-direction:column;gap:10px}
 
         /* --- Mobile top bar + horizontal nav --- */
         .tfp-topbar{display:none;padding:16px 18px;border-bottom:1px solid var(--border);align-items:center;justify-content:space-between;gap:12px;position:sticky;top:0;background:var(--bg);z-index:5}
@@ -641,12 +750,14 @@ function Shell({ tab, setTab, children, loading, saveError }) {
         .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px}
         .btn{display:inline-flex;align-items:center;gap:6px;padding:10px 16px;border-radius:8px;border:1px solid var(--border);background:#ffffff0d;color:var(--text);font-size:14px;font-weight:600;cursor:pointer;transition:.15s}
         .btn:hover{background:#ffffff1a}
+        .btn:disabled{opacity:.45;cursor:not-allowed}
         .btn.primary{background:var(--amber);color:#14171c;border-color:var(--amber)}
         .btn.primary:hover{background:#ffcb2b}
         .btn.danger{color:var(--red);border-color:#e5484d33}
         .btn.danger:hover{background:#e5484d1a}
         input,select,textarea{background:#0f1216;border:1px solid var(--border);color:var(--text);border-radius:7px;padding:10px 12px;font-size:14.5px;font-family:inherit;width:100%}
         input:focus,select:focus,textarea:focus{outline:2px solid var(--amber);outline-offset:1px}
+        button:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
         table{width:100%;border-collapse:collapse;font-size:14px}
         th{text-align:left;color:var(--muted);font-weight:600;padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
         td{padding:11px 12px;border-bottom:1px solid #ffffff0a}
@@ -708,11 +819,10 @@ function Shell({ tab, setTab, children, loading, saveError }) {
             </React.Fragment>
           ))}
         </nav>
-        {saveError && (
-          <div className="tfp-sidebar-foot">
-            <div className="save-warn"><AlertTriangle size={14} />Salvarea a eșuat</div>
-          </div>
-        )}
+        <div className="tfp-sidebar-foot">
+          <SaveBadge state={saveState} />
+          <BackupControls onBackup={onBackup} onRestore={onRestore} />
+        </div>
       </aside>
 
       <div className="tfp-main">
@@ -725,7 +835,7 @@ function Shell({ tab, setTab, children, loading, saveError }) {
               <div style={{ fontSize: 11, color: "var(--muted)" }}>Gestionare taxi</div>
             </div>
           </div>
-          {saveError && <div className="save-warn"><AlertTriangle size={14} />Salvarea a eșuat</div>}
+          <SaveBadge state={saveState} />
         </div>
 
         <div className="tfp-nav">
@@ -740,12 +850,18 @@ function Shell({ tab, setTab, children, loading, saveError }) {
         {current && (
           <div className="tfp-pageheader">
             <div className="disp tfp-pagetitle">{current.label}</div>
-            {saveError && <div className="save-warn"><AlertTriangle size={14} />Salvarea a eșuat</div>}
+            <SaveBadge state={saveState} />
           </div>
         )}
 
         <div className="tfp-body">{children}</div>
 
+        {/* Backup și pe mobil (sidebar-ul e ascuns acolo) */}
+        {onBackup && (
+          <div className="tfp-footer" style={{ display: "flex", justifyContent: "center", paddingBottom: 6, borderTop: "none" }}>
+            <div className="tfp-mobile-backup"><BackupControls onBackup={onBackup} onRestore={onRestore} /></div>
+          </div>
+        )}
         <div className="tfp-footer">© {footerYear ?? ""} Nichita Ivanov. Toate drepturile rezervate.</div>
       </div>
     </div>
@@ -762,7 +878,7 @@ function Dashboard({ data, setTab }) {
   const wIdx = currentWeekIndex(year, month, day, ranges);
   const range = ranges[wIdx];
 
-  const activeCars = data.cars.filter((c) => c.status === "activa").length;
+  const activeCars = data.cars.filter(isCarActive).length;
   const inService = data.cars.filter((c) => c.status === "service").length;
 
   const weekRows = data.cars.map((c) => {
@@ -778,8 +894,12 @@ function Dashboard({ data, setTab }) {
   const profitWeek = incomeWeek - expensesWeek;
   const problemCount = weekRows.filter((r) => r.status === "unpaid" || r.status === "partial").length;
 
+  const carNr = (id) => { const c = data.cars.find((x) => x.id === id); return c ? c.nr : "mașină ștearsă"; };
+  const expiryText = (days) => (days < 0 ? "expirată" : days === 0 ? "expiră azi" : `în ${days} zile`);
   const insuranceAlerts = data.insurances.filter((ins) => { const d = daysUntil(ins.dataExpirare); return d != null && d <= 30; });
   const inspectionAlerts = data.inspections.filter((insp) => { const d = daysUntil(insp.dataExpirare); return d != null && d <= 30; });
+  const insuranceDetail = insuranceAlerts.map((i) => `${carNr(i.carId)} (${i.tip ? i.tip.toLowerCase() + ", " : ""}${expiryText(daysUntil(i.dataExpirare))})`).join(" · ");
+  const inspectionDetail = inspectionAlerts.map((i) => `${carNr(i.carId)} (${expiryText(daysUntil(i.dataExpirare))})`).join(" · ");
 
   // Cash/card ADUSE AZI — introduse manual de tine în Calendar (modul "Pe zile"), NU din Yandex.
   const cashCardToday = (() => {
@@ -808,6 +928,7 @@ function Dashboard({ data, setTab }) {
     { label: "Șoferi", value: data.drivers.length, icon: Users, sub: `${data.drivers.filter((d) => d.activ).length} activi` },
     { label: "Cash adus azi", value: fmtMoney(cashCardToday.cash), icon: Wallet, sub: todayISO(), mono: true },
     { label: "Card adus azi", value: fmtMoney(cashCardToday.card), icon: TrendingUp, sub: todayISO(), mono: true, accent: true },
+    { label: "Profit săptămâna", value: fmtMoney(profitWeek), icon: profitWeek >= 0 ? TrendingUp : TrendingDown, sub: `${fmtMoney(incomeWeek)} adus − ${fmtMoney(expensesWeek)} cheltuit`, mono: true, accent: profitWeek >= 0 },
   ];
 
   return (
@@ -842,14 +963,20 @@ function Dashboard({ data, setTab }) {
       {insuranceAlerts.length > 0 && (
         <div className="card" style={{ borderColor: "#f2841c55", marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
           <Shield size={17} color="var(--orange)" />
-          <div style={{ fontSize: 13.5 }}>{insuranceAlerts.length} asigurăr{insuranceAlerts.length === 1 ? "e expiră" : "i expiră"} în curând sau au expirat.</div>
+          <div style={{ fontSize: 13.5 }}>
+            {insuranceAlerts.length} asigurăr{insuranceAlerts.length === 1 ? "e expiră" : "i expiră"} în curând sau au expirat.
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>{insuranceDetail}</div>
+          </div>
           <button className="btn" style={{ marginLeft: "auto" }} onClick={() => setTab("insurance")}>Deschide asigurări</button>
         </div>
       )}
       {inspectionAlerts.length > 0 && (
         <div className="card" style={{ borderColor: "#f2841c55", marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
           <Wrench size={17} color="var(--orange)" />
-          <div style={{ fontSize: 13.5 }}>{inspectionAlerts.length} revizi{inspectionAlerts.length === 1 ? "e tehnică expiră" : "i tehnice expiră"} în curând sau au expirat.</div>
+          <div style={{ fontSize: 13.5 }}>
+            {inspectionAlerts.length} revizi{inspectionAlerts.length === 1 ? "e tehnică expiră" : "i tehnice expiră"} în curând sau au expirat.
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>{inspectionDetail}</div>
+          </div>
           <button className="btn" style={{ marginLeft: "auto" }} onClick={() => setTab("inspection")}>Deschide revizii</button>
         </div>
       )}
@@ -899,10 +1026,19 @@ function EmptyState({ text }) {
   return <div style={{ color: "var(--muted)", fontSize: 13.5, padding: "18px 0", textAlign: "center" }}>{text}</div>;
 }
 
+function useEscape(onClose) {
+  useEffect(() => {
+    const h = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+}
+
 function ConfirmModal({ message, onConfirm, onCancel }) {
+  useEscape(onCancel);
   return (
     <div className="modal-backdrop" onClick={onCancel}>
-      <div className="modal" style={{ maxWidth: 360 }} onClick={(e) => e.stopPropagation()}>
+      <div className="modal" role="alertdialog" aria-modal="true" style={{ maxWidth: 360 }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
           <AlertTriangle size={20} color="var(--red)" />
           <div className="disp" style={{ fontWeight: 700, fontSize: 16 }}>Confirmă ștergerea</div>
@@ -974,8 +1110,8 @@ function CarsView({ data, update }) {
                       })()}
                     </td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-                      <button className="btn" style={{ padding: 6, marginRight: 6 }} onClick={() => setEditing(c)}><Pencil size={14} /></button>
-                      <button className="btn danger" style={{ padding: 6 }} onClick={() => setConfirm({ message: `Ștergi mașina ${c.nr}? Această acțiune nu poate fi anulată.`, action: () => remove(c.id) })}><Trash2 size={14} /></button>
+                      <button className="btn" style={{ padding: 6, marginRight: 6 }} aria-label={`Editează mașina ${c.nr}`} onClick={() => setEditing(c)}><Pencil size={14} /></button>
+                      <button className="btn danger" style={{ padding: 6 }} aria-label={`Șterge mașina ${c.nr}`} onClick={() => setConfirm({ message: `Ștergi mașina ${c.nr}? Plățile ei rămân în istoric, dar fără mașină. Dacă a fost doar vândută, e mai bine să schimbi statusul în „Vândută". Acțiunea nu poate fi anulată.`, action: () => remove(c.id) })}><Trash2 size={14} /></button>
                     </td>
                   </tr>
                 );
@@ -987,7 +1123,7 @@ function CarsView({ data, update }) {
 
       {editing && (
         <Modal onClose={() => setEditing(null)} title={editing.id ? "Editează mașina" : "Adaugă mașină"}>
-          <CarForm car={editing} drivers={data.drivers} onSave={save} onCancel={() => setEditing(null)} />
+          <CarForm car={editing} cars={data.cars} drivers={data.drivers} onSave={save} onCancel={() => setEditing(null)} />
         </Modal>
       )}
       {confirm && (
@@ -1007,9 +1143,19 @@ function CarStatusPill({ status }) {
   return <span className="pill" style={{ background: m.bg, color: m.color }}>{m.label}</span>;
 }
 
-function CarForm({ car, drivers, onSave, onCancel }) {
+function CarForm({ car, cars, drivers, onSave, onCancel }) {
   const [f, setF] = useState(car);
+  const [err, setErr] = useState("");
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const trySave = () => {
+    const nr = (f.nr || "").trim();
+    if (!nr) { setErr("Completează numărul de înmatriculare."); return; }
+    const dup = (cars || []).some((c) => c.id !== f.id && (c.nr || "").trim().toLowerCase() === nr.toLowerCase());
+    if (dup) { setErr(`Există deja o mașină cu numărul ${nr}.`); return; }
+    if (Number(f.tarif) < 0) { setErr("Tariful nu poate fi negativ."); return; }
+    setErr("");
+    onSave({ ...f, nr });
+  };
   return (
     <div>
       <div className="field"><label>Număr înmatriculare</label><input value={f.nr} onChange={(e) => set("nr", e.target.value)} placeholder="EWM 110" /></div>
@@ -1061,8 +1207,9 @@ function CarForm({ car, drivers, onSave, onCancel }) {
         </div>
         <UnavailablePeriodsEditor periods={f.unavailablePeriods || []} onChange={(next) => set("unavailablePeriods", next)} />
       </div>
+      {err && <div className="save-warn" style={{ marginTop: 10 }}><AlertTriangle size={14} />{err}</div>}
       <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={() => f.nr && onSave(f)}><Check size={15} />Salvează</button>
+        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={trySave}><Check size={15} />Salvează</button>
         <button className="btn" onClick={onCancel}>Anulează</button>
       </div>
     </div>
@@ -1102,7 +1249,7 @@ function UnavailablePeriodsEditor({ periods, onChange }) {
                 {!p.end && (
                   <button type="button" className="btn" style={{ padding: "4px 8px", fontSize: 11.5, marginLeft: "auto" }} onClick={() => closeToday(p.id)}>Închide azi</button>
                 )}
-                <button type="button" className="btn danger" style={{ padding: 5, marginLeft: p.end ? "auto" : 0 }} onClick={() => remove(p.id)}><Trash2 size={13} /></button>
+                <button type="button" className="btn danger" style={{ padding: 5, marginLeft: p.end ? "auto" : 0 }} aria-label="Șterge perioada" onClick={() => remove(p.id)}><Trash2 size={13} /></button>
               </div>
             ))}
         </div>
@@ -1171,8 +1318,8 @@ function DriversView({ data, update }) {
                     <td>{car ? car.nr : <span style={{ color: "var(--muted)" }}>nealocat</span>}</td>
                     <td><span className="pill" style={{ background: d.activ ? "#2bb67322" : "#8b93a122", color: d.activ ? "var(--green)" : "var(--muted)" }}>{d.activ ? "Activ" : "Inactiv"}</span></td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-                      <button className="btn" style={{ padding: 6, marginRight: 6 }} onClick={() => setEditing(d)}><Pencil size={14} /></button>
-                      <button className="btn danger" style={{ padding: 6 }} onClick={() => setConfirm({ message: `Ștergi șoferul ${d.nume}? Această acțiune nu poate fi anulată.`, action: () => remove(d.id) })}><Trash2 size={14} /></button>
+                      <button className="btn" style={{ padding: 6, marginRight: 6 }} aria-label={`Editează șoferul ${d.nume}`} onClick={() => setEditing(d)}><Pencil size={14} /></button>
+                      <button className="btn danger" style={{ padding: 6 }} aria-label={`Șterge șoferul ${d.nume}`} onClick={() => setConfirm({ message: `Ștergi șoferul ${d.nume}? Istoricul plăților rămâne, dar fără numele lui. Dacă nu mai lucrează la tine, e mai bine să-l pui „Inactiv". Acțiunea nu poate fi anulată.`, action: () => remove(d.id) })}><Trash2 size={14} /></button>
                     </td>
                   </tr>
                 );
@@ -1196,7 +1343,13 @@ function DriversView({ data, update }) {
 
 function DriverForm({ driver, onSave, onCancel }) {
   const [f, setF] = useState(driver);
+  const [err, setErr] = useState("");
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const trySave = () => {
+    if (!(f.nume || "").trim()) { setErr("Completează numele șoferului."); return; }
+    setErr("");
+    onSave({ ...f, nume: f.nume.trim() });
+  };
   return (
     <div>
       <div className="field"><label>Nume complet</label><input value={f.nume} onChange={(e) => set("nume", e.target.value)} placeholder="Bordian Vladimir" /></div>
@@ -1205,8 +1358,9 @@ function DriverForm({ driver, onSave, onCancel }) {
         <input type="checkbox" style={{ width: "auto" }} checked={f.activ} onChange={(e) => set("activ", e.target.checked)} id="activ-chk" />
         <label htmlFor="activ-chk" style={{ margin: 0 }}>Șofer activ</label>
       </div>
+      {err && <div className="save-warn" style={{ marginTop: 10 }}><AlertTriangle size={14} />{err}</div>}
       <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={() => f.nume && onSave(f)}><Check size={15} />Salvează</button>
+        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={trySave}><Check size={15} />Salvează</button>
         <button className="btn" onClick={onCancel}>Anulează</button>
       </div>
     </div>
@@ -1328,12 +1482,12 @@ function WeeklyCalendarView({ data, update }) {
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-        <button className="btn" style={{ padding: 8 }} onClick={() => changeMonth(-1)}><ChevronLeft size={16} /></button>
+        <button className="btn" style={{ padding: 8 }} aria-label="Luna anterioară" onClick={() => changeMonth(-1)}><ChevronLeft size={16} /></button>
         <div className="disp" style={{ fontSize: 18, fontWeight: 700, minWidth: 170, textAlign: "center" }}>{MONTHS_RO[month]} {year}</div>
-        <button className="btn" style={{ padding: 8 }} onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
+        <button className="btn" style={{ padding: 8 }} aria-label="Luna următoare" onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
       </div>
 
-<div className="field" style={{ marginBottom: 10 }}>
+      <div className="field" style={{ marginBottom: 10 }}>
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Caută mașină după număr, marcă sau model…" />
       </div>
 
@@ -1405,6 +1559,7 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
     <div className="card" style={{ marginBottom: 10, padding: 0, overflow: "hidden" }}>
       <button
         onClick={onToggle}
+        aria-expanded={expanded}
         style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "14px 16px", background: "transparent", border: "none", cursor: "pointer", color: "var(--text)", textAlign: "left" }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
@@ -1428,6 +1583,7 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
           value={car.status || "activa"}
           onClick={(e) => e.stopPropagation()}
           onChange={(e) => onSetStatus(e.target.value)}
+          aria-label={`Status mașină ${car.nr}`}
           style={{ width: "auto", padding: "5px 8px", fontSize: 12 }}
         >
           <option value="activa">Activă</option>
@@ -1453,8 +1609,8 @@ function CarWeekCard({ car, data, year, month, ranges, todayIdx, driver, expande
         {car.startDate ? (
           <span className="pill" style={{ background: "#ffffff0d", color: "var(--muted)" }}>
             Activ din {fmtDateRO(car.startDate)}
-            <button type="button" onClick={(e) => { e.stopPropagation(); setEditingStart((v) => !v); }} style={{ background: "none", border: "none", padding: 0, marginLeft: 4, cursor: "pointer", color: "var(--muted)", display: "flex" }}><Pencil size={11} /></button>
-            <button type="button" onClick={clearStart} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: "var(--muted)", display: "flex" }}><X size={12} /></button>
+            <button type="button" aria-label="Editează data de început" onClick={(e) => { e.stopPropagation(); setEditingStart((v) => !v); }} style={{ background: "none", border: "none", padding: 0, marginLeft: 4, cursor: "pointer", color: "var(--muted)", display: "flex" }}><Pencil size={11} /></button>
+            <button type="button" aria-label="Șterge data de început" onClick={clearStart} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: "var(--muted)", display: "flex" }}><X size={12} /></button>
           </span>
         ) : (
           <>
@@ -1544,10 +1700,10 @@ function WeekRow({ car, data, year, month, weekIdx, range, ranges, isCurrent, on
       {mode === "total" ? (
         <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
           <div style={{ width: 90 }}>
-            <input type="number" placeholder="Numerar" value={cash} onChange={(e) => setCash(e.target.value)} onBlur={commitTotal} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} />
+            <input type="number" inputMode="decimal" placeholder="Numerar" value={cash} onChange={(e) => setCash(e.target.value)} onBlur={commitTotal} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} />
           </div>
           <div style={{ width: 90 }}>
-            <input type="number" placeholder="Card" value={card} onChange={(e) => setCard(e.target.value)} onBlur={commitTotal} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} />
+            <input type="number" inputMode="decimal" placeholder="Card" value={card} onChange={(e) => setCard(e.target.value)} onBlur={commitTotal} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} />
           </div>
         </div>
       ) : (
@@ -1613,8 +1769,8 @@ function DayRow({ car, year, month, day, rec, onSetDay }) {
       {worked ? (
         <div style={{ marginTop: 6, marginLeft: 70 }}>
           <div style={{ display: "flex", gap: 8 }}>
-            <input type="number" placeholder="Numerar" value={cash} onChange={(e) => setCash(e.target.value)} onBlur={commitAmounts} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} />
-            <input type="number" placeholder="Card" value={card} onChange={(e) => setCard(e.target.value)} onBlur={commitAmounts} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} />
+            <input type="number" inputMode="decimal" placeholder="Numerar" value={cash} onChange={(e) => setCash(e.target.value)} onBlur={commitAmounts} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} />
+            <input type="number" inputMode="decimal" placeholder="Card" value={card} onChange={(e) => setCard(e.target.value)} onBlur={commitAmounts} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} />
           </div>
           <div style={{ marginTop: 6 }}>
             <input
@@ -1717,11 +1873,11 @@ function InsuranceView({ data, update }) {
                   <tr key={ins.id}>
                     <td style={{ fontWeight: 600 }}>{car ? car.nr : <span style={{ color: "var(--muted)" }}>mașină ștearsă</span>}</td>
                     <td>{ins.tip}</td>
-                    <td className="mono">{ins.dataExpirare || "—"}</td>
+                    <td className="mono">{fmtDateRO(ins.dataExpirare) || "—"}</td>
                     <td><InsuranceStatusPill status={status} days={days} /></td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-                      <button className="btn" style={{ padding: 6, marginRight: 6 }} onClick={() => setEditing(ins)}><Pencil size={14} /></button>
-                      <button className="btn danger" style={{ padding: 6 }} onClick={() => setConfirm({ message: "Ștergi această asigurare? Această acțiune nu poate fi anulată.", action: () => remove(ins.id) })}><Trash2 size={14} /></button>
+                      <button className="btn" style={{ padding: 6, marginRight: 6 }} aria-label="Editează asigurarea" onClick={() => setEditing(ins)}><Pencil size={14} /></button>
+                      <button className="btn danger" style={{ padding: 6 }} aria-label="Șterge asigurarea" onClick={() => setConfirm({ message: "Ștergi această asigurare? Această acțiune nu poate fi anulată.", action: () => remove(ins.id) })}><Trash2 size={14} /></button>
                     </td>
                   </tr>
                 );
@@ -1748,7 +1904,7 @@ function InsuranceView({ data, update }) {
 function InsuranceStatusPill({ status, days }) {
   const map = {
     ok: { label: `Valabilă (${days} zile)`, bg: "#2bb67322", color: "var(--green)" },
-    soon: { label: days < 0 ? "Expiră azi" : `Expiră în ${days} zile`, bg: "#f2841c22", color: "var(--orange)" },
+    soon: { label: days === 0 ? "Expiră azi" : `Expiră în ${days} zile`, bg: "#f2841c22", color: "var(--orange)" },
     expired: { label: `Expirată de ${Math.abs(days)} zile`, bg: "#e5484d22", color: "var(--red)" },
     unknown: { label: "Fără dată", bg: "#8b93a122", color: "var(--muted)" },
   };
@@ -1758,7 +1914,14 @@ function InsuranceStatusPill({ status, days }) {
 
 function InsuranceForm({ ins, cars, onSave, onCancel }) {
   const [f, setF] = useState(ins);
+  const [err, setErr] = useState("");
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const trySave = () => {
+    if (!f.carId) { setErr("Alege mașina."); return; }
+    if (!f.dataExpirare) { setErr("Alege data expirării."); return; }
+    setErr("");
+    onSave(f);
+  };
   return (
     <div>
       <div className="field">
@@ -1774,8 +1937,9 @@ function InsuranceForm({ ins, cars, onSave, onCancel }) {
         </select>
       </div>
       <div className="field"><label>Data expirării</label><input type="date" value={f.dataExpirare} onChange={(e) => set("dataExpirare", e.target.value)} /></div>
+      {err && <div className="save-warn" style={{ marginTop: 10 }}><AlertTriangle size={14} />{err}</div>}
       <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={() => f.carId && f.dataExpirare && onSave(f)}><Check size={15} />Salvează</button>
+        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={trySave}><Check size={15} />Salvează</button>
         <button className="btn" onClick={onCancel}>Anulează</button>
       </div>
     </div>
@@ -1850,11 +2014,11 @@ function InspectionView({ data, update }) {
                 return (
                   <tr key={insp.id}>
                     <td style={{ fontWeight: 600 }}>{car ? car.nr : <span style={{ color: "var(--muted)" }}>mașină ștearsă</span>}</td>
-                    <td className="mono">{insp.dataExpirare || "—"}</td>
+                    <td className="mono">{fmtDateRO(insp.dataExpirare) || "—"}</td>
                     <td><InsuranceStatusPill status={status} days={days} /></td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-                      <button className="btn" style={{ padding: 6, marginRight: 6 }} onClick={() => setEditing(insp)}><Pencil size={14} /></button>
-                      <button className="btn danger" style={{ padding: 6 }} onClick={() => setConfirm({ message: "Ștergi această revizie tehnică? Această acțiune nu poate fi anulată.", action: () => remove(insp.id) })}><Trash2 size={14} /></button>
+                      <button className="btn" style={{ padding: 6, marginRight: 6 }} aria-label="Editează revizia" onClick={() => setEditing(insp)}><Pencil size={14} /></button>
+                      <button className="btn danger" style={{ padding: 6 }} aria-label="Șterge revizia" onClick={() => setConfirm({ message: "Ștergi această revizie tehnică? Această acțiune nu poate fi anulată.", action: () => remove(insp.id) })}><Trash2 size={14} /></button>
                     </td>
                   </tr>
                 );
@@ -1880,7 +2044,14 @@ function InspectionView({ data, update }) {
 
 function InspectionForm({ insp, cars, onSave, onCancel }) {
   const [f, setF] = useState(insp);
+  const [err, setErr] = useState("");
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const trySave = () => {
+    if (!f.carId) { setErr("Alege mașina."); return; }
+    if (!f.dataExpirare) { setErr("Alege data până la care e valabilă."); return; }
+    setErr("");
+    onSave(f);
+  };
   return (
     <div>
       <div className="field">
@@ -1890,8 +2061,9 @@ function InspectionForm({ insp, cars, onSave, onCancel }) {
         </select>
       </div>
       <div className="field"><label>Valabilă până la</label><input type="date" value={f.dataExpirare} onChange={(e) => set("dataExpirare", e.target.value)} /></div>
+      {err && <div className="save-warn" style={{ marginTop: 10 }}><AlertTriangle size={14} />{err}</div>}
       <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={() => f.carId && f.dataExpirare && onSave(f)}><Check size={15} />Salvează</button>
+        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={trySave}><Check size={15} />Salvează</button>
         <button className="btn" onClick={onCancel}>Anulează</button>
       </div>
     </div>
@@ -1913,12 +2085,12 @@ function FinanceView({ data, update }) {
     .filter((p) => p.year === year && p.month === month)
     .reduce((s, p) => s + Number(p.paidAmount || 0), 0);
 
-const restante = data.cars.reduce((s, car) => {
-  if (!car.driverId) return s; // doar mașini cu șofer alocat momentan
-  const plan = monthlyPlanBase(data, car, year, month); // fără moștenire din lunile trecute — pornește curat, de azi
-  const paid = monthlyPaid(data, year, month, debtOwnerId(car));
-  return s + Math.max(plan - paid, 0);
-}, 0);
+  const restante = data.cars.reduce((s, car) => {
+    if (!car.driverId) return s; // doar mașini cu șofer alocat momentan
+    const plan = monthlyPlanBase(data, car, year, month); // fără moștenire din lunile trecute — pornește curat, de azi
+    const paid = monthlyPaid(data, year, month, debtOwnerId(car));
+    return s + Math.max(plan - paid, 0);
+  }, 0);
 
   const dailyBreakdown = useMemo(() => {
     const map = {};
@@ -1966,16 +2138,16 @@ const restante = data.cars.reduce((s, car) => {
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
-        <button className="btn" style={{ padding: 8 }} onClick={() => changeMonth(-1)}><ChevronLeft size={16} /></button>
+        <button className="btn" style={{ padding: 8 }} aria-label="Luna anterioară" onClick={() => changeMonth(-1)}><ChevronLeft size={16} /></button>
         <div className="disp" style={{ fontSize: 18, fontWeight: 700, minWidth: 170, textAlign: "center" }}>{MONTHS_RO[month]} {year}</div>
-        <button className="btn" style={{ padding: 8 }} onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
+        <button className="btn" style={{ padding: 8 }} aria-label="Luna următoare" onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px,1fr))", gap: 12, marginBottom: 18 }}>
         <MiniStat label="Venituri" value={fmtMoney(totalIncome)} color="var(--green)" />
         <MiniStat label="Cheltuieli" value={fmtMoney(totalExpenses)} color="var(--red)" />
         <MiniStat label="Profit" value={fmtMoney(profit)} color={profit >= 0 ? "var(--green)" : "var(--red)"} />
-        <MiniStat label="Restanțe" value={fmtMoney(restante)} color="var(--orange)" />
+        <MiniStat label="Restanță lună (fără luni vechi)" value={fmtMoney(restante)} color="var(--orange)" />
       </div>
 
       <div className="finance-grid" style={{ display: "grid", gap: 14 }}>
@@ -1991,7 +2163,7 @@ const restante = data.cars.reduce((s, car) => {
                 {data.incomes.filter((i) => i.data.startsWith(mk)).map((i) => (
                   <tr key={i.id}>
                     <td>{i.descriere}</td><td className="mono" style={{ color: "var(--green)" }}>{fmtMoney(i.suma)}</td>
-                    <td style={{ textAlign: "right" }}><button className="btn danger" style={{ padding: 5 }} onClick={() => setConfirm({ message: "Ștergi acest venit? Această acțiune nu poate fi anulată.", action: () => delIncome(i.id) })}><Trash2 size={13} /></button></td>
+                    <td style={{ textAlign: "right" }}><button className="btn danger" style={{ padding: 5 }} aria-label="Șterge venitul" onClick={() => setConfirm({ message: "Ștergi acest venit? Această acțiune nu poate fi anulată.", action: () => delIncome(i.id) })}><Trash2 size={13} /></button></td>
                   </tr>
                 ))}
               </tbody>
@@ -2009,17 +2181,18 @@ const restante = data.cars.reduce((s, car) => {
               <tbody>
                 {expensesMonth.map((e) => {
                   const drv = data.drivers.find((d) => d.id === e.șoferId);
+                  const expCar = data.cars.find((c) => c.id === e.carId);
                   return (
                     <tr key={e.id}>
                       <td>
                         {e.descriere}
                         <div style={{ fontSize: 11, color: "var(--muted)" }}>
-                          {e.categorie} · {fmtDateRO(e.data)}{drv ? ` · ${drv.nume}` : ""}
+                          {e.categorie} · {fmtDateRO(e.data)}{expCar ? ` · ${expCar.nr}` : ""}{drv ? ` · ${drv.nume}` : ""}
                           {(e.cash || e.card) ? ` · Num ${fmtMoney(e.cash || 0)} / Card ${fmtMoney(e.card || 0)}` : ""}
                         </div>
                       </td>
                       <td className="mono" style={{ color: "var(--red)" }}>{fmtMoney(e.suma)}</td>
-                      <td style={{ textAlign: "right" }}><button className="btn danger" style={{ padding: 5 }} onClick={() => setConfirm({ message: "Ștergi această cheltuială? Această acțiune nu poate fi anulată.", action: () => delExpense(e.id) })}><Trash2 size={13} /></button></td>
+                      <td style={{ textAlign: "right" }}><button className="btn danger" style={{ padding: 5 }} aria-label="Șterge cheltuiala" onClick={() => setConfirm({ message: "Ștergi această cheltuială? Această acțiune nu poate fi anulată.", action: () => delExpense(e.id) })}><Trash2 size={13} /></button></td>
                     </tr>
                   );
                 })}
@@ -2066,7 +2239,7 @@ const restante = data.cars.reduce((s, car) => {
 
       {showExpense && (
         <Modal onClose={() => setShowExpense(false)} title="Adaugă cheltuială">
-          <ExpenseForm drivers={data.drivers} onSave={(e) => { addExpense(e); setShowExpense(false); }} onCancel={() => setShowExpense(false)} />
+          <ExpenseForm drivers={data.drivers} cars={data.cars} onSave={(e) => { addExpense(e); setShowExpense(false); }} onCancel={() => setShowExpense(false)} />
         </Modal>
       )}
       {showIncome && (
@@ -2121,13 +2294,27 @@ function MiniStat({ label, value, color }) {
   );
 }
 
-function ExpenseForm({ onSave, onCancel, drivers }) {
-  const [f, setF] = useState(() => ({ data: todayISO(), descriere: "", categorie: "Motorină", șoferId: "", cash: "", card: "" }));
+function ExpenseForm({ onSave, onCancel, drivers, cars }) {
+  const [f, setF] = useState(() => ({ data: todayISO(), descriere: "", categorie: "Motorină", șoferId: "", carId: "", cash: "", card: "" }));
+  const [err, setErr] = useState("");
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
   const suma = Number(f.cash || 0) + Number(f.card || 0);
+  const trySave = () => {
+    if (!f.descriere.trim()) { setErr("Completează descrierea."); return; }
+    if (Number(f.cash || 0) < 0 || Number(f.card || 0) < 0) { setErr("Sumele nu pot fi negative."); return; }
+    if (suma <= 0) { setErr("Introdu o sumă (numerar sau card)."); return; }
+    setErr("");
+    onSave({ ...f, descriere: f.descriere.trim(), cash: Number(f.cash || 0), card: Number(f.card || 0), suma });
+  };
   return (
     <div>
       <div className="field"><label>Ziua</label><input type="date" value={f.data} onChange={(e) => set("data", e.target.value)} /></div>
+      <div className="field"><label>Mașină (opțional — ca să vezi profitul pe mașină)</label>
+        <select value={f.carId} onChange={(e) => set("carId", e.target.value)}>
+          <option value="">— fără mașină —</option>
+          {(cars || []).map((c) => <option key={c.id} value={c.id}>{c.nr} — {c.marca} {c.model}</option>)}
+        </select>
+      </div>
       <div className="field"><label>Șofer (opțional)</label>
         <select value={f.șoferId} onChange={(e) => set("șoferId", e.target.value)}>
           <option value="">— fără șofer —</option>
@@ -2141,15 +2328,13 @@ function ExpenseForm({ onSave, onCancel, drivers }) {
         </select>
       </div>
       <div style={{ display: "flex", gap: 8 }}>
-        <div className="field" style={{ flex: 1 }}><label>Numerar (lei)</label><input type="number" value={f.cash} onChange={(e) => set("cash", e.target.value)} /></div>
-        <div className="field" style={{ flex: 1 }}><label>Card (lei)</label><input type="number" value={f.card} onChange={(e) => set("card", e.target.value)} /></div>
+        <div className="field" style={{ flex: 1 }}><label>Numerar (lei)</label><input type="number" inputMode="decimal" value={f.cash} onChange={(e) => set("cash", e.target.value)} /></div>
+        <div className="field" style={{ flex: 1 }}><label>Card (lei)</label><input type="number" inputMode="decimal" value={f.card} onChange={(e) => set("card", e.target.value)} /></div>
       </div>
       <div style={{ fontSize: 12, color: "var(--muted)", marginTop: -6, marginBottom: 10 }}>Total scos din cont: <b className="mono">{fmtMoney(suma)}</b></div>
+      {err && <div className="save-warn" style={{ marginBottom: 8 }}><AlertTriangle size={14} />{err}</div>}
       <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-        <button
-          className="btn primary" style={{ flex: 1, justifyContent: "center" }}
-          onClick={() => f.descriere && suma > 0 && onSave({ ...f, cash: Number(f.cash || 0), card: Number(f.card || 0), suma })}
-        ><Check size={15} />Salvează</button>
+        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={trySave}><Check size={15} />Salvează</button>
         <button className="btn" onClick={onCancel}>Anulează</button>
       </div>
     </div>
@@ -2158,14 +2343,22 @@ function ExpenseForm({ onSave, onCancel, drivers }) {
 
 function IncomeForm({ onSave, onCancel }) {
   const [f, setF] = useState(() => ({ data: todayISO(), descriere: "", suma: "" }));
+  const [err, setErr] = useState("");
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const trySave = () => {
+    if (!f.descriere.trim()) { setErr("Completează descrierea."); return; }
+    if (!(Number(f.suma) > 0)) { setErr("Introdu o sumă mai mare ca 0."); return; }
+    setErr("");
+    onSave({ ...f, descriere: f.descriere.trim(), suma: Number(f.suma) });
+  };
   return (
     <div>
       <div className="field"><label>Dată</label><input type="date" value={f.data} onChange={(e) => set("data", e.target.value)} /></div>
       <div className="field"><label>Descriere</label><input value={f.descriere} onChange={(e) => set("descriere", e.target.value)} placeholder="Închiriere ocazională" /></div>
-      <div className="field"><label>Sumă (lei)</label><input type="number" value={f.suma} onChange={(e) => set("suma", e.target.value)} /></div>
+      <div className="field"><label>Sumă (lei)</label><input type="number" inputMode="decimal" value={f.suma} onChange={(e) => set("suma", e.target.value)} /></div>
+      {err && <div className="save-warn" style={{ marginTop: 6 }}><AlertTriangle size={14} />{err}</div>}
       <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={() => f.descriere && f.suma && onSave({ ...f, suma: Number(f.suma) })}><Check size={15} />Salvează</button>
+        <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={trySave}><Check size={15} />Salvează</button>
         <button className="btn" onClick={onCancel}>Anulează</button>
       </div>
     </div>
@@ -2267,9 +2460,9 @@ function EarningsView({ data, update }) {
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-        <button className="btn" style={{ padding: 8 }} onClick={() => shiftDate(-1)}><ChevronLeft size={16} /></button>
+        <button className="btn" style={{ padding: 8 }} aria-label="Ziua anterioară" onClick={() => shiftDate(-1)}><ChevronLeft size={16} /></button>
         <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={{ maxWidth: 170 }} />
-        <button className="btn" style={{ padding: 8 }} onClick={() => shiftDate(1)}><ChevronRight size={16} /></button>
+        <button className="btn" style={{ padding: 8 }} aria-label="Ziua următoare" onClick={() => shiftDate(1)}><ChevronRight size={16} /></button>
         {date !== todayISO() && <button className="btn" onClick={() => setDate(todayISO())}>Azi</button>}
         <div style={{ marginLeft: "auto", fontSize: 12, color: "var(--muted)" }}>
           {enteredCount}/{rows.length} mașini completate
@@ -2348,7 +2541,7 @@ function EarningsRow({ car, driver, dayRec, worked, onCommit, onToggleWorked }) 
   const total = (Number(cash) || 0) + (Number(card) || 0);
 
   return (
-    <tr>
+    <tr style={!dayRec ? { boxShadow: "inset 3px 0 0 var(--amber)" } : undefined}>
       <td>
         <div style={{ fontWeight: 600 }}>{driver ? driver.nume : <span style={{ color: "var(--muted)" }}>—</span>}</div>
         <div style={{ fontSize: 11.5, color: "var(--muted)" }}>{car.nr}{car.marca ? ` · ${car.marca} ${car.model}` : ""}</div>
@@ -2361,8 +2554,8 @@ function EarningsRow({ car, driver, dayRec, worked, onCommit, onToggleWorked }) 
       </td>
       {worked ? (
         <>
-          <td style={{ minWidth: 110 }}><input type="number" placeholder="0" value={cash} onChange={(e) => setCash(e.target.value)} onBlur={commit} /></td>
-          <td style={{ minWidth: 110 }}><input type="number" placeholder="0" value={card} onChange={(e) => setCard(e.target.value)} onBlur={commit} /></td>
+          <td style={{ minWidth: 110 }}><input type="number" inputMode="decimal" placeholder="0" value={cash} onChange={(e) => setCash(e.target.value)} onBlur={commit} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} /></td>
+          <td style={{ minWidth: 110 }}><input type="number" inputMode="decimal" placeholder="0" value={card} onChange={(e) => setCard(e.target.value)} onBlur={commit} onKeyDown={(e) => e.key === "Enter" && e.target.blur()} /></td>
           <td className="mono" style={{ fontWeight: 700 }}>{fmtMoney(total)}</td>
         </>
       ) : (
@@ -2393,6 +2586,18 @@ function ReportsView({ data }) {
     });
     // Restanțele mai mari primele, ca să vezi imediat ce trebuie urmărit.
     return rows.sort((a, b) => b.rest - a.rest || b.paid - a.paid);
+  }, [data, year, month]);
+
+  // Profit pe mașină = ce a adus mașina în luna asta − cheltuielile legate de ea.
+  const profitPerCar = useMemo(() => {
+    const mk = monthKey(year, month);
+    return data.cars.map((car) => {
+      const income = monthlyPaid(data, year, month, debtOwnerId(car));
+      const costs = data.expenses
+        .filter((e) => e.carId === car.id && e.data && e.data.startsWith(mk))
+        .reduce((s, e) => s + Number(e.suma || 0), 0);
+      return { car, income, costs, profit: income - costs };
+    }).filter((r) => r.income > 0 || r.costs > 0).sort((a, b) => b.profit - a.profit);
   }, [data, year, month]);
 
   const filteredCars = useMemo(() => {
@@ -2429,9 +2634,9 @@ function ReportsView({ data }) {
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
-        <button className="btn" style={{ padding: 8 }} onClick={() => changeMonth(-1)}><ChevronLeft size={16} /></button>
+        <button className="btn" style={{ padding: 8 }} aria-label="Luna anterioară" onClick={() => changeMonth(-1)}><ChevronLeft size={16} /></button>
         <div className="disp" style={{ fontSize: 18, fontWeight: 700, minWidth: 170, textAlign: "center" }}>{MONTHS_RO[month]} {year}</div>
-        <button className="btn" style={{ padding: 8 }} onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
+        <button className="btn" style={{ padding: 8 }} aria-label="Luna următoare" onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px,1fr))", gap: 12, marginBottom: 10 }}>
@@ -2535,6 +2740,32 @@ function ReportsView({ data }) {
           )}
         </>
       )}
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <div style={{ fontWeight: 700, marginBottom: 4 }} className="disp">Profit pe mașină — {MONTHS_RO[month]}</div>
+        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 10 }}>
+          Adus de mașină − cheltuielile la care ai ales mașina (service, ulei, spălătorie etc.). Cheltuielile fără mașină nu apar aici.
+        </div>
+        {profitPerCar.length === 0 ? (
+          <EmptyState text="Nimic de arătat încă. Când adaugi o cheltuială în Finanțe, alege și mașina ei." />
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr><th>Mașină</th><th>Adus</th><th>Cheltuieli</th><th>Profit</th></tr></thead>
+              <tbody>
+                {profitPerCar.map(({ car, income, costs, profit }) => (
+                  <tr key={car.id}>
+                    <td style={{ fontWeight: 600 }}>{car.nr} <span style={{ color: "var(--muted)", fontWeight: 400 }}>· {car.marca} {car.model}</span></td>
+                    <td className="mono" style={{ color: "var(--green)" }}>{fmtMoney(income)}</td>
+                    <td className="mono" style={{ color: costs > 0 ? "var(--red)" : "var(--muted)" }}>{fmtMoney(costs)}</td>
+                    <td className="mono" style={{ fontWeight: 700, color: profit >= 0 ? "var(--green)" : "var(--red)" }}>{fmtMoney(profit)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -2542,12 +2773,13 @@ function ReportsView({ data }) {
 /* ============================== MODAL ============================== */
 
 function Modal({ title, children, onClose }) {
+  useEscape(onClose);
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal" role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
           <div className="disp" style={{ fontWeight: 700, fontSize: 16 }}>{title}</div>
-          <button className="btn" style={{ padding: 6 }} onClick={onClose}><X size={15} /></button>
+          <button className="btn" style={{ padding: 6 }} aria-label="Închide" onClick={onClose}><X size={15} /></button>
         </div>
         {children}
       </div>

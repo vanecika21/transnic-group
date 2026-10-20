@@ -4,7 +4,7 @@ import {
   Car, Users, Calendar as CalendarIcon, Wallet, BarChart3, Plus, X,
   Trash2, Pencil, Check, AlertTriangle, ChevronLeft, ChevronRight,
   Phone, Loader2, TrendingUp, TrendingDown, Gauge, Shield, Wrench, Search,
-  Download, History, FileText, Send
+  Download, History, FileText, Send, Bell
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -16,6 +16,10 @@ import {
    automatically to the next month's plan.
 
    MODIFICĂRI FĂCUTE (față de versiunea anterioară):
+   - NOU: Notificările de pe Dashboard se pot ascunde/afișa individual
+     (buton "Notificări"). Implicit sunt ascunse "Încasări lipsă" și
+     "Restanțe". Asigurările/reviziile arată lista cu numere doar la
+     apăsarea butonului "Detalii". Setarea se ține în localStorage.
    - Scos butonul "Restaurează" (a rămas doar Backup = descarcă JSON)
    - NOU: Istoric modificări (audit log) — filă în meniul "Bani".
      Înregistrează: încasări (numerar/card/a lucrat), totaluri pe
@@ -955,12 +959,39 @@ function Shell({ tab, setTab, children, loading, saveState, onBackup }) {
 
 /* ============================== DASHBOARD ============================== */
 
+// Notificările de pe Dashboard pot fi ascunse/afișate individual.
+// Preferințele se țin în localStorage (separat pe fiecare dispozitiv).
+const ALERT_DEFAULTS = { earnings: false, arrears: false, insurance: true, inspection: true };
+const ALERT_LABELS = {
+  earnings: "Mașini fără încasările de azi",
+  arrears: "Mașini cu restanță în săptămână",
+  insurance: "Asigurări care expiră",
+  inspection: "Revizii tehnice care expiră",
+};
+
 function Dashboard({ data, setTab }) {
   const now = nowMoldova();
   const year = now.getFullYear(), month = now.getMonth(), day = now.getDate();
   const ranges = weekRanges(year, month);
   const wIdx = currentWeekIndex(year, month, day, ranges);
   const range = ranges[wIdx];
+
+  // Preferințe notificări (se citesc din localStorage abia după montare,
+  // ca să nu apară erori de hidratare).
+  const [alertPrefs, setAlertPrefs] = useState(ALERT_DEFAULTS);
+  const [showAlertSettings, setShowAlertSettings] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("tfp-alert-prefs");
+      if (raw) setAlertPrefs({ ...ALERT_DEFAULTS, ...JSON.parse(raw) });
+    } catch {}
+  }, []);
+  const togglePref = (k) => setAlertPrefs((p) => {
+    const n = { ...p, [k]: !p[k] };
+    try { localStorage.setItem("tfp-alert-prefs", JSON.stringify(n)); } catch {}
+    return n;
+  });
 
   const activeCars = data.cars.filter(isCarActive).length;
   const inService = data.cars.filter((c) => c.status === "service").length;
@@ -1035,38 +1066,56 @@ function Dashboard({ data, setTab }) {
 
       <DuplicateDriverWarning items={dupToday} dateLabel="azi" />
 
-      {missingTodayCount > 0 && (
-        <div className="card" style={{ borderColor: "#f2b70555", marginBottom: 16, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+        <button className="btn" style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => setShowAlertSettings((v) => !v)}>
+          <Bell size={13} />Notificări
+        </button>
+      </div>
+
+      {showAlertSettings && (
+        <div className="card" style={{ marginBottom: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+          {Object.entries(ALERT_LABELS).map(([k, label]) => (
+            <label key={k} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13.5, cursor: "pointer" }}>
+              <input type="checkbox" style={{ width: "auto" }} checked={alertPrefs[k]} onChange={() => togglePref(k)} />
+              {label}
+            </label>
+          ))}
+        </div>
+      )}
+
+      {alertPrefs.earnings && missingTodayCount > 0 && (
+        <div className="card" style={{ borderColor: "#f2b70555", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "12px 16px" }}>
           <TrendingUp size={17} color="var(--amber)" />
           <div style={{ fontSize: 13.5 }}>{missingTodayCount} mașin{missingTodayCount === 1 ? "ă nu are" : "i nu au"} încă încasările de azi introduse.</div>
           <button className="btn primary" style={{ marginLeft: "auto" }} onClick={() => setTab("earnings")}>Introdu acum</button>
         </div>
       )}
-      {problemCount > 0 && (
-        <div className="card" style={{ borderColor: "#e5484d55", marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
+      {alertPrefs.arrears && problemCount > 0 && (
+        <div className="card" style={{ borderColor: "#e5484d55", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, padding: "12px 16px" }}>
           <AlertTriangle size={17} color="var(--red)" />
           <div style={{ fontSize: 13.5 }}>{problemCount} mașin{problemCount === 1 ? "ă are" : "i au"} restanță în săptămâna asta.</div>
           <button className="btn" style={{ marginLeft: "auto" }} onClick={() => setTab("calendar")}>Deschide calendar</button>
         </div>
       )}
-      {insuranceAlerts.length > 0 && (
-        <div className="card" style={{ borderColor: "#f2841c55", marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
+      {alertPrefs.insurance && insuranceAlerts.length > 0 && (
+        <div className="card" style={{ borderColor: "#f2841c55", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", flexWrap: "wrap" }}>
           <Shield size={17} color="var(--orange)" />
-          <div style={{ fontSize: 13.5 }}>
+          <div style={{ fontSize: 13.5, flex: 1, minWidth: 200 }}>
             {insuranceAlerts.length} asigurăr{insuranceAlerts.length === 1 ? "e expiră" : "i expiră"} în curând sau au expirat.
-            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>{insuranceDetail}</div>
+            {showDetails && <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>{insuranceDetail}</div>}
           </div>
-          <button className="btn" style={{ marginLeft: "auto" }} onClick={() => setTab("insurance")}>Deschide asigurări</button>
+          <button className="btn" style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => setShowDetails((v) => !v)}>{showDetails ? "Ascunde" : "Detalii"}</button>
+          <button className="btn" onClick={() => setTab("insurance")}>Deschide</button>
         </div>
       )}
-      {inspectionAlerts.length > 0 && (
-        <div className="card" style={{ borderColor: "#f2841c55", marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
+      {alertPrefs.inspection && inspectionAlerts.length > 0 && (
+        <div className="card" style={{ borderColor: "#f2841c55", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", flexWrap: "wrap" }}>
           <Wrench size={17} color="var(--orange)" />
-          <div style={{ fontSize: 13.5 }}>
+          <div style={{ fontSize: 13.5, flex: 1, minWidth: 200 }}>
             {inspectionAlerts.length} revizi{inspectionAlerts.length === 1 ? "e tehnică expiră" : "i tehnice expiră"} în curând sau au expirat.
-            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>{inspectionDetail}</div>
+            {showDetails && <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>{inspectionDetail}</div>}
           </div>
-          <button className="btn" style={{ marginLeft: "auto" }} onClick={() => setTab("inspection")}>Deschide revizii</button>
+          <button className="btn" onClick={() => setTab("inspection")}>Deschide</button>
         </div>
       )}
 

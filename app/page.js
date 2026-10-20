@@ -148,6 +148,41 @@ function fmtRate(car) {
   return car.tarifPeriod === "luna" ? `${fmtMoney(car.tarif)}/lună` : `${fmtMoney(car.tarif)}/zi`;
 }
 
+/* ---------------- ISTORIC TARIFE ----------------
+   car.tarif / car.tarifPeriod = tariful ACTUAL (valabil pentru toate zilele
+   care nu sunt acoperite de o perioadă din car.tarifHistory).
+   car.tarifHistory = perioade din trecut: { id, from, to, tarif, tarifPeriod }
+   - from gol = "de la început"; to = ultima zi (inclusiv) cu acel tarif.
+   Planul se calculează zi cu zi, cu tariful valabil în ziua respectivă. */
+function addDaysISO(iso, n) {
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(y, m - 1, d + n);
+  return isoDay(dt.getFullYear(), dt.getMonth(), dt.getDate());
+}
+function tariffOnDay(car, year, month, day) {
+  const iso = isoDay(year, month, day);
+  const periods = car.tarifHistory || [];
+  for (const p of periods) {
+    if (p.from && iso < p.from) continue;
+    if (p.to && iso > p.to) continue;
+    return { tarif: Number(p.tarif) || 0, tarifPeriod: p.tarifPeriod || "zi" };
+  }
+  return { tarif: Number(car.tarif) || 0, tarifPeriod: car.tarifPeriod || "zi" };
+}
+function dayRateOn(car, year, month, day) {
+  const t = tariffOnDay(car, year, month, day);
+  if (t.tarifPeriod === "luna") {
+    const wd = workingDaysInMonth(car, year, month);
+    return wd > 0 ? t.tarif / wd : 0;
+  }
+  return t.tarif;
+}
+function fmtTariffHistory(car) {
+  const list = car.tarifHistory || [];
+  if (!list.length) return "fără perioade";
+  return list.map((p) => `${p.from ? fmtDateRO(p.from) : "început"}–${p.to ? fmtDateRO(p.to) : "?"}: ${fmtRate(p)}`).join("; ");
+}
+
 function weekKey(year, month, ownerId, weekIdx) { return `${year}-${String(month + 1).padStart(2, "0")}__${ownerId}__${weekIdx}`; }
 function weeklyRecord(data, year, month, ownerId, weekIdx) { return data.weeklyPayments[weekKey(year, month, ownerId, weekIdx)] || null; }
 function weeklyPaid(data, year, month, ownerId, weekIdx) {
@@ -410,11 +445,12 @@ function unavailablePeriodOnDay(car, year, month, day) {
     return dateOnly <= eOnly;
   }) || null;
 }
-function workingDaysEffective(data, car, year, month, weekIdx, ranges) {
-  if (!isCarActive(car)) return 0;
+// Zilele din săptămână care intră în plan (lista, ca să putem aplica tariful pe fiecare zi).
+function countedDays(data, car, year, month, weekIdx, ranges) {
+  if (!isCarActive(car)) return [];
   const r = ranges[weekIdx];
   const rec = weeklyRecord(data, year, month, debtOwnerId(car), weekIdx);
-  let count = 0;
+  const counted = [];
   for (let d = r.start; d <= r.end; d++) {
     const dayRec = rec && rec.dailyAmounts ? rec.dailyAmounts[d] : null;
     if (!isCarWorkDay(car, year, month, d)) {
@@ -426,15 +462,21 @@ function workingDaysEffective(data, car, year, month, weekIdx, ranges) {
     if (!isDayElapsed(year, month, d)) continue;
     if (isDayUnavailable(car, year, month, d)) continue;
     if (dayRec && dayRec.worked === false) continue;
-    count++;
+    counted.push(d);
   }
-  return count;
+  return counted;
+}
+function workingDaysEffective(data, car, year, month, weekIdx, ranges) {
+  return countedDays(data, car, year, month, weekIdx, ranges).length;
+}
+// Planul de bază al unei săptămâni = suma tarifelor valabile în fiecare zi numărată.
+function weekPlanBase(data, car, year, month, weekIdx, ranges) {
+  return countedDays(data, car, year, month, weekIdx, ranges).reduce((s, d) => s + dayRateOn(car, year, month, d), 0);
 }
 function monthlyPlanBase(data, car, year, month) {
   const ranges = weekRanges(year, month);
-  const rate = dailyRate(car, year, month);
   let total = 0;
-  for (let i = 0; i < ranges.length; i++) total += rate * workingDaysEffective(data, car, year, month, i, ranges);
+  for (let i = 0; i < ranges.length; i++) total += weekPlanBase(data, car, year, month, i, ranges);
   return total;
 }
 function monthlyPaid(data, year, month, ownerId) {
@@ -469,7 +511,7 @@ function monthlyPlanWithCarry(data, car, year, month) {
 }
 function weekPlan(data, car, year, month, weekIdx, ranges) {
   if (!isCarActive(car)) return 0;
-  const base = dailyRate(car, year, month) * workingDaysEffective(data, car, year, month, weekIdx, ranges);
+  const base = weekPlanBase(data, car, year, month, weekIdx, ranges);
   return weekIdx === 0 ? base + carryoverFromPrevMonth(data, car, year, month) : base;
 }
 
@@ -1242,6 +1284,9 @@ function CarsView({ data, update }) {
         if (Number(old.tarif) !== Number(saved.tarif) || (old.tarifPeriod || "zi") !== (saved.tarifPeriod || "zi")) {
           entries.push({ type: "masina", carId: saved.id, carNr: saved.nr, text: `Tarif ${saved.nr}: ${fmtRate(old)} → ${fmtRate(saved)}` });
         }
+        if (JSON.stringify(old.tarifHistory || []) !== JSON.stringify(saved.tarifHistory || [])) {
+          entries.push({ type: "masina", carId: saved.id, carNr: saved.nr, text: `Istoric tarife ${saved.nr}: ${fmtTariffHistory(old)} → ${fmtTariffHistory(saved)}` });
+        }
         if ((old.status || "activa") !== (saved.status || "activa")) {
           entries.push({ type: "masina", carId: saved.id, carNr: saved.nr, text: `Status ${saved.nr}: ${CAR_STATUS_LABELS[old.status || "activa"] || old.status} → ${CAR_STATUS_LABELS[saved.status || "activa"] || saved.status}` });
         }
@@ -1329,7 +1374,10 @@ function CarStatusPill({ status }) {
 function CarForm({ car, cars, drivers, onSave, onCancel }) {
   const [f, setF] = useState(car);
   const [err, setErr] = useState("");
+  const [effFrom, setEffFrom] = useState(() => todayISO());
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  // Tariful actual a fost schimbat față de cel salvat? (doar la editare)
+  const tarifChanged = !!car.id && (Number(f.tarif) !== Number(car.tarif) || (f.tarifPeriod || "zi") !== (car.tarifPeriod || "zi"));
   // Șoferul ales e deja alocat la ALTĂ mașină? (avertisment, nu blocăm salvarea)
   const driverClash = f.driverId ? (cars || []).find((c) => c.id !== f.id && c.driverId === f.driverId) : null;
   const trySave = () => {
@@ -1338,8 +1386,29 @@ function CarForm({ car, cars, drivers, onSave, onCancel }) {
     const dup = (cars || []).some((c) => c.id !== f.id && (c.nr || "").trim().toLowerCase() === nr.toLowerCase());
     if (dup) { setErr(`Există deja o mașină cu numărul ${nr}.`); return; }
     if (Number(f.tarif) < 0) { setErr("Tariful nu poate fi negativ."); return; }
+    const history = (f.tarifHistory || []).map((p) => ({ ...p, tarif: Number(p.tarif) || 0 }));
+    for (const p of history) {
+      if (!p.to) { setErr("La fiecare perioadă din istoricul de tarife completează „Până la”."); return; }
+      if (p.from && p.from > p.to) { setErr("În istoricul de tarife, „De la” nu poate fi după „Până la”."); return; }
+      if (p.tarif < 0) { setErr("Un tarif din istoric este negativ."); return; }
+    }
+    // Tariful actual s-a schimbat și ai ales o dată: tariful VECHI se păstrează
+    // ca perioadă în trecut, până în ziua dinaintea datei alese.
+    if (tarifChanged && effFrom) {
+      const lastTo = history.reduce((m, p) => (p.to > m ? p.to : m), "");
+      const from = lastTo ? addDaysISO(lastTo, 1) : "";
+      const to = addDaysISO(effFrom, -1);
+      if (from && from > to) { setErr("Data de aplicare se suprapune cu istoricul de tarife. Alege o dată mai târzie sau corectează istoricul."); return; }
+      history.push({ id: uid(), from, to, tarif: Number(car.tarif) || 0, tarifPeriod: car.tarifPeriod || "zi" });
+    }
+    for (let i = 0; i < history.length; i++) {
+      for (let j = i + 1; j < history.length; j++) {
+        const a = history[i], b = history[j];
+        if ((a.from || "0000-00-00") <= b.to && (b.from || "0000-00-00") <= a.to) { setErr("Două perioade din istoricul de tarife se suprapun."); return; }
+      }
+    }
     setErr("");
-    onSave({ ...f, nr });
+    onSave({ ...f, nr, tarifHistory: history });
   };
   return (
     <div>
@@ -1358,6 +1427,19 @@ function CarForm({ car, cars, drivers, onSave, onCancel }) {
             <option value="luna">lei / lună</option>
           </select>
         </div>
+      </div>
+      {tarifChanged && (
+        <div className="field">
+          <label>Noul tarif se aplică de la</label>
+          <input type="date" value={effFrom} onChange={(e) => setEffFrom(e.target.value)} />
+          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
+            Zilele dinainte rămân cu tariful vechi ({fmtRate(car)}). Dacă lași data goală, noul tarif se aplică și pentru trecut (corecție).
+          </div>
+        </div>
+      )}
+      <div className="field">
+        <label>Istoric tarife (perioade din trecut cu alt tarif)</label>
+        <TariffHistoryEditor periods={f.tarifHistory || []} defaultTarif={f.tarif} defaultPeriod={f.tarifPeriod || "zi"} onChange={(next) => set("tarifHistory", next)} />
       </div>
       <div className="field">
         <label>Zile lucrate pe săptămână</label>
@@ -1402,6 +1484,43 @@ function CarForm({ car, cars, drivers, onSave, onCancel }) {
         <button className="btn primary" style={{ flex: 1, justifyContent: "center" }} onClick={trySave}><Check size={15} />Salvează</button>
         <button className="btn" onClick={onCancel}>Anulează</button>
       </div>
+    </div>
+  );
+}
+
+function TariffHistoryEditor({ periods, defaultTarif, defaultPeriod, onChange }) {
+  const upd = (id, patch) => onChange(periods.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  const remove = (id) => onChange(periods.filter((p) => p.id !== id));
+  const add = () => onChange([...periods, { id: uid(), from: "", to: "", tarif: Number(defaultTarif) || 0, tarifPeriod: defaultPeriod || "zi" }]);
+  const lbl = { fontSize: 11, color: "var(--muted)", marginBottom: 3 };
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>
+        Tariful de mai sus se aplică pentru toate zilele care nu sunt acoperite de o perioadă de aici. Poți edita oricând perioadele vechi; planul și restanțele se recalculează automat. „De la” gol = de la început.
+      </div>
+      {periods.map((p) => (
+        <div key={p.id} style={{ background: "#ffffff0d", borderRadius: 8, padding: 10, marginBottom: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 130px" }}>
+              <div style={lbl}>De la</div>
+              <input type="date" value={p.from || ""} onChange={(e) => upd(p.id, { from: e.target.value })} />
+            </div>
+            <div style={{ flex: "1 1 130px" }}>
+              <div style={lbl}>Până la (inclusiv)</div>
+              <input type="date" value={p.to || ""} onChange={(e) => upd(p.id, { to: e.target.value })} />
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+            <input type="number" style={{ flex: 1 }} value={p.tarif} onChange={(e) => upd(p.id, { tarif: e.target.value })} />
+            <select style={{ flex: 1 }} value={p.tarifPeriod || "zi"} onChange={(e) => upd(p.id, { tarifPeriod: e.target.value })}>
+              <option value="zi">lei / zi</option>
+              <option value="luna">lei / lună</option>
+            </select>
+            <button type="button" className="btn danger" style={{ padding: 6 }} aria-label="Șterge perioada de tarif" onClick={() => remove(p.id)}><Trash2 size={13} /></button>
+          </div>
+        </div>
+      ))}
+      <button type="button" className="btn" onClick={add}><Plus size={14} />Adaugă perioadă cu alt tarif</button>
     </div>
   );
 }

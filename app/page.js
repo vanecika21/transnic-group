@@ -16,6 +16,11 @@ import {
    automatically to the next month's plan.
 
    MODIFICĂRI FĂCUTE (față de versiunea anterioară):
+   - NOU: Căutare comună (carMatchesSearch) în Calendar și Încasări zilnice:
+     se caută după nume șofer ȘI după nr. de înmatriculare (plus marcă/model).
+     Ignoră majusculele, diacriticele și spațiile ("ewm110" găsește "EWM 110").
+     În Calendar se găsesc și șoferii care au adus bani pe mașina respectivă
+     în luna afișată; în Încasări zilnice și șoferul trecut pe ziua respectivă.
    - NOU: Notificările de pe Dashboard se pot ascunde/afișa individual
      (buton "Notificări"). Implicit sunt ascunse "Încasări lipsă" și
      "Restanțe". Asigurările/reviziile arată lista cu numere doar la
@@ -108,6 +113,25 @@ function isoDay(year, month, day) {
 function daysInMonth(year, month) { return new Date(year, month + 1, 0).getDate(); }
 function monthKey(y, m) { return `${y}-${String(m + 1).padStart(2, "0")}`; }
 function isSunday(year, month, day) { return new Date(year, month, day).getDay() === 0; }
+
+/* ---------------- CĂUTARE COMUNĂ (nume șofer + nr. înmatriculare) ----------------
+   Folosită în Calendar și în Încasări zilnice. Caută în: nr. înmatriculare,
+   marcă, model și numele șoferilor dați. Ignoră majusculele, diacriticele și
+   spațiile, deci "ewm110" găsește "EWM 110", iar "bordian" găsește "Bordian Vladimir". */
+const normSearch = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, "");
+
+function carMatchesSearch(car, drivers, query) {
+  const q = normSearch(query);
+  if (!q) return true;
+  const hay = [car.nr, car.marca, car.model, `${car.marca || ""}${car.model || ""}`];
+  (drivers || []).filter(Boolean).forEach((d) => hay.push(d.nume));
+  return hay.some((h) => normSearch(h).includes(q));
+}
 
 // Câte zile pe săptămână lucrează șoferul mașinii (5, 6 sau 7).
 // Implicit 6 = păstrează comportamentul vechi (toate zilele, în afară de duminică).
@@ -1704,13 +1728,25 @@ function WeeklyCalendarView({ data, update }) {
   const ranges = weekRanges(year, month);
   const todayIdx = (year === now.getFullYear() && month === now.getMonth()) ? currentWeekIndex(year, month, now.getDate(), ranges) : -1;
 
+  // Căutare după nume șofer ȘI nr. înmatriculare (+ marcă/model).
+  // Se potrivesc: șoferul actual al mașinii + oricine a adus bani pe mașina
+  // asta în luna afișată (ca să găsești și un șofer care a condus-o doar o perioadă).
   const filteredCars = useMemo(() => {
-    const term = search.trim().toLowerCase();
     return [...data.cars]
-      .filter((c) => !term || c.nr.toLowerCase().includes(term) || `${c.marca} ${c.model}`.toLowerCase().includes(term))
+      .filter((c) => {
+        const ids = new Set();
+        if (c.driverId) ids.add(c.driverId);
+        Object.values(data.weeklyPayments || {}).forEach((rec) => {
+          if (!rec || rec.carId !== c.id || rec.year !== year || rec.month !== month) return;
+          if (rec.driverId) ids.add(rec.driverId);
+          Object.values(rec.dailyAmounts || {}).forEach((dd) => { if (dd && dd.driverId) ids.add(dd.driverId); });
+        });
+        const drvs = Array.from(ids).map((id) => data.drivers.find((d) => d.id === id));
+        return carMatchesSearch(c, drvs, search);
+      })
       .filter((c) => driverFilter === "toate" || (driverFilter === "cu_sofer" && c.driverId) || (driverFilter === "fara_sofer" && !c.driverId))
       .sort((a, b) => a.nr.localeCompare(b.nr, "ro", { sensitivity: "base", numeric: true }));
-  }, [data.cars, search, driverFilter]);
+  }, [data.cars, data.drivers, data.weeklyPayments, search, driverFilter, year, month]);
 
   const changeMonth = (delta) => {
     // Dacă mai ai un câmp de sumă activ (necomis încă), forțează salvarea lui
@@ -1847,8 +1883,14 @@ function WeeklyCalendarView({ data, update }) {
         <button className="btn" style={{ padding: 8 }} aria-label="Luna următoare" onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
       </div>
 
-      <div className="field" style={{ marginBottom: 10 }}>
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Caută mașină după număr, marcă sau model…" />
+      <div className="field" style={{ marginBottom: 10, position: "relative" }}>
+        <Search size={15} color="var(--muted)" style={{ position: "absolute", left: 11, top: "50%", transform: "translateY(-50%)" }} />
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Caută după șofer sau nr. înmatriculare…"
+          style={{ paddingLeft: 34 }}
+        />
       </div>
 
       <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
@@ -2807,16 +2849,15 @@ function EarningsView({ data, update }) {
   }, { cash: 0, card: 0 });
   const enteredCount = rows.filter((r) => !!r.dayRec).length;
 
+  // Căutare după nume șofer ȘI nr. înmatriculare (+ marcă/model). Se potrivește
+  // și șoferul trecut pe ziua respectivă, dacă diferă de cel alocat acum mașinii.
   const filteredRows = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter(({ car, driver }) =>
-      (driver && driver.nume.toLowerCase().includes(q)) ||
-      car.nr.toLowerCase().includes(q) ||
-      (car.marca && car.marca.toLowerCase().includes(q)) ||
-      (car.model && car.model.toLowerCase().includes(q))
-    );
-  }, [rows, search]);
+    if (!search.trim()) return rows;
+    return rows.filter(({ car, driver, dayRec }) => {
+      const dayDriver = dayRec && dayRec.driverId ? data.drivers.find((dd) => dd.id === dayRec.driverId) : null;
+      return carMatchesSearch(car, [driver, dayDriver], search);
+    });
+  }, [rows, search, data.drivers]);
 
   const shiftDate = (delta) => {
     const dt = new Date(year, month, day + delta);

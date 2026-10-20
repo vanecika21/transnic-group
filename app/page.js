@@ -4,7 +4,7 @@ import {
   Car, Users, Calendar as CalendarIcon, Wallet, BarChart3, Plus, X,
   Trash2, Pencil, Check, AlertTriangle, ChevronLeft, ChevronRight,
   Phone, Loader2, TrendingUp, TrendingDown, Gauge, Shield, Wrench, Search,
-  Download, Upload
+  Download, History, FileText, Send
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -16,18 +16,22 @@ import {
    automatically to the next month's plan.
 
    MODIFICĂRI FĂCUTE (față de versiunea anterioară):
-   - Buton Backup (descarcă JSON) + Restaurează din fișier
+   - Scos butonul "Restaurează" (a rămas doar Backup = descarcă JSON)
+   - NOU: Istoric modificări (audit log) — filă în meniul "Bani".
+     Înregistrează: încasări (numerar/card/a lucrat), totaluri pe
+     săptămână, cheltuieli, venituri extra, schimbări la mașini
+     (șofer, tarif, status, dată început, ștergere) și ștergeri de șoferi.
+     Se păstrează ultimele 1000 de înregistrări (AUDIT_MAX).
+   - NOU: Fișa șoferului (buton în lista de șoferi): totaluri pe lună,
+     zile cu încasare, zile libere, medie/zi, cheltuieli, istoric pe 6 luni,
+     tabel pe zile și trimitere raport pe WhatsApp.
+   - NOU: Avertisment când același șofer apare pe 2+ mașini în aceeași zi
+     (Dashboard, Încasări zilnice) și când alegi un șofer deja alocat
+     altei mașini (formularul de mașină).
    - Indicator de salvare: "Se salvează… / Salvat / Salvarea a eșuat"
    - Protecție: nu se trimite niciodată pe server o stare complet goală
      peste date care existau deja
    - update() nu mai salvează din interiorul setData (fără salvări duble)
-   - Fonturile se încarcă corect (@import mutat primul în CSS)
-   - Eticheta "Expiră azi" corectă; date în format RO la asigurări/revizii
-   - Dashboard: profit săptămâna, mașinile concrete cu documente care expiră,
-     numărarea mașinilor active cu isCarActive
-   - Cheltuieli: câmp opțional "Mașină" + raport "Profit pe mașină" în Rapoarte
-   - Mesaje de ștergere mai clare (recomandă "Vândută"/"Inactiv")
-   - Esc închide ferestrele, aria-label pe butoanele cu iconiță
 ---------------------------------------------------------------- */
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -63,6 +67,7 @@ const emptyData = () => ({
   incomes: [],
   insurances: [],
   inspections: [],
+  auditLog: [],        // istoric modificări, cele mai noi primele (vezi pushAudit)
 });
 
 function fmtMoney(n) {
@@ -81,6 +86,20 @@ function fmtDateRO(dateStr) {
     timeZone: "Europe/Chisinau",
     day: "2-digit", month: "2-digit", year: "numeric",
   }).format(d);
+}
+// Dată + oră (pentru istoricul de modificări), tot în fusul Europe/Chisinau.
+function fmtDateTimeRO(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("ro-RO", {
+    timeZone: "Europe/Chisinau",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  }).format(d);
+}
+function isoDay(year, month, day) {
+  return `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 function daysInMonth(year, month) { return new Date(year, month + 1, 0).getDate(); }
 function monthKey(y, m) { return `${y}-${String(m + 1).padStart(2, "0")}`; }
@@ -145,6 +164,95 @@ function recDaySums(rec) {
   });
   return { cash, card };
 }
+
+/* ---------------- ISTORIC MODIFICĂRI (audit log) ----------------
+   Fiecare modificare importantă adaugă o înregistrare în data.auditLog,
+   ÎN ACEEAȘI operație cu modificarea (deci se salvează împreună, atomic).
+   Cele mai noi sunt primele. Păstrăm doar ultimele AUDIT_MAX ca blob-ul
+   să nu crească la nesfârșit. */
+const AUDIT_MAX = 1000;
+function pushAudit(prev, entries) {
+  const list = (Array.isArray(entries) ? entries : [entries]).filter(Boolean);
+  const current = prev.auditLog || [];
+  if (!list.length) return current;
+  const at = new Date().toISOString();
+  const added = list.map((e) => ({ id: uid(), at, ...e }));
+  return [...added, ...current].slice(0, AUDIT_MAX);
+}
+const CAR_STATUS_LABELS = { activa: "Activă", service: "În service", vanduta: "Vândută" };
+function dayMoneyState(d) {
+  const worked = !d || d.worked !== false;
+  return {
+    worked,
+    cash: worked && d ? Number(d.cash || 0) : 0,
+    card: worked && d ? Number(d.card || 0) : 0,
+  };
+}
+// Compară starea unei zile ÎNAINTE și DUPĂ; întoarce [] dacă nu s-a schimbat nimic important.
+function dayAuditEntries(data, car, year, month, day, before, after, source) {
+  const b = dayMoneyState(before), a = dayMoneyState(after);
+  const planB = !!(before && before.countsInPlan), planA = !!(after && after.countsInPlan);
+  if (b.worked === a.worked && b.cash === a.cash && b.card === a.card && planB === planA) return [];
+  const drvId = (after && after.driverId) || car.driverId || null;
+  const drv = data.drivers.find((d) => d.id === drvId);
+  const parts = [];
+  if (b.worked !== a.worked) parts.push(a.worked ? "marcat „A lucrat”" : "marcat „Nu a lucrat”");
+  if (b.cash !== a.cash) parts.push(`numerar ${fmtMoney(b.cash)} → ${fmtMoney(a.cash)}`);
+  if (b.card !== a.card) parts.push(`card ${fmtMoney(b.card)} → ${fmtMoney(a.card)}`);
+  if (planB !== planA) parts.push(planA ? "ziua numără în plan" : "ziua nu mai numără în plan");
+  const date = isoDay(year, month, day);
+  return [{
+    type: "incasare", source, carId: car.id, carNr: car.nr,
+    driverId: drvId, driverName: drv ? drv.nume : "", date,
+    text: `${car.nr}${drv ? " · " + drv.nume : ""} · ${fmtDateRO(date)}: ${parts.join(", ")}`,
+  }];
+}
+
+/* ---------------- ȘOFER PE 2 MAȘINI ÎN ACEEAȘI ZI ----------------
+   Un șofer "apare" pe o mașină într-o zi dacă acolo are încasare > 0 și
+   ziua nu e marcată "Nu a lucrat". Dacă apare pe 2+ mașini → avertisment. */
+function duplicateDriverDays(data, year, month, day) {
+  const map = new Map(); // driverId -> Map(carId -> {carId, carNr, total})
+  Object.values(data.weeklyPayments || {}).forEach((rec) => {
+    if (!rec || rec.year !== year || rec.month !== month || !rec.dailyAmounts) return;
+    const dd = rec.dailyAmounts[day];
+    if (!dd || dd.worked === false) return;
+    const total = Number(dd.cash || 0) + Number(dd.card || 0);
+    if (total <= 0) return;
+    const car = data.cars.find((c) => c.id === rec.carId);
+    const driverId = dd.driverId || rec.driverId || (car && car.driverId);
+    if (!driverId) return;
+    if (!map.has(driverId)) map.set(driverId, new Map());
+    map.get(driverId).set(rec.carId, { carId: rec.carId, carNr: car ? car.nr : "mașină ștearsă", total });
+  });
+  return Array.from(map.entries())
+    .filter(([, byCar]) => byCar.size > 1)
+    .map(([driverId, byCar]) => ({ driverId, driver: data.drivers.find((d) => d.id === driverId), cars: Array.from(byCar.values()) }))
+    .filter((x) => x.driver);
+}
+
+/* ---------------- FIȘA ȘOFERULUI: zilele atribuite unui șofer ---------------- */
+function driverDayRecords(data, driverId) {
+  const out = [];
+  Object.values(data.weeklyPayments || {}).forEach((rec) => {
+    if (!rec || !rec.dailyAmounts) return;
+    const car = data.cars.find((c) => c.id === rec.carId);
+    Object.entries(rec.dailyAmounts).forEach(([day, dd]) => {
+      if (!dd) return;
+      const who = dd.driverId || rec.driverId || (car && car.driverId);
+      if (who !== driverId) return;
+      const worked = dd.worked !== false;
+      out.push({
+        year: rec.year, month: rec.month, day: Number(day),
+        carId: rec.carId, carNr: car ? car.nr : "mașină ștearsă",
+        worked, cash: worked ? Number(dd.cash || 0) : 0, card: worked ? Number(dd.card || 0) : 0,
+        note: dd.note || "",
+      });
+    });
+  });
+  return out;
+}
+
 // Migrare unică, NEDISTRUCTIVĂ: plățile (până acum legate de șofer) trec pe mașină.
 //  - înregistrările unice doar își schimbă cheia (conținutul rămâne identic);
 //  - dacă 2+ înregistrări cad pe aceeași mașină+săptămână (schimb de șofer sau
@@ -568,7 +676,7 @@ export default function TaxiFleetPro() {
     persist(migrated);
   }, [data, persist, applyData]);
 
-  // ---- Backup / Restaurare ----
+  // ---- Backup ----
   const onBackup = () => {
     const cur = dataRef.current;
     if (!cur) return;
@@ -581,24 +689,6 @@ export default function TaxiFleetPro() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
-  const onRestore = async (file) => {
-    try {
-      const text = await file.text();
-      const parsed = JSON.parse(text);
-      const incoming = parsed && parsed.cars === undefined && parsed.data ? parsed.data : parsed;
-      if (!incoming || !Array.isArray(incoming.cars) || !Array.isArray(incoming.drivers)) throw new Error("format");
-      const ok = window.confirm(
-        `Restaurezi backup-ul? (${incoming.cars.length} mașini, ${incoming.drivers.length} șoferi)\n\n` +
-        "Datele curente vor fi ÎNLOCUITE. Dacă nu ești sigur, apasă Anulează și descarcă mai întâi un backup al datelor de acum."
-      );
-      if (!ok) return;
-      const next = { ...emptyData(), ...incoming };
-      applyData(next);
-      persist(next);
-    } catch {
-      window.alert("Fișierul nu este un backup valid de Taxi Fleet Pro.");
-    }
   };
 
   if (loadFailed) {
@@ -626,7 +716,7 @@ export default function TaxiFleetPro() {
   }
 
   return (
-    <Shell tab={tab} setTab={setTab} saveState={saveState} onBackup={onBackup} onRestore={onRestore}>
+    <Shell tab={tab} setTab={setTab} saveState={saveState} onBackup={onBackup}>
       {tab === "dashboard" && <Dashboard data={data} setTab={setTab} />}
       {tab === "cars" && <CarsView data={data} update={update} />}
       {tab === "drivers" && <DriversView data={data} update={update} />}
@@ -636,6 +726,7 @@ export default function TaxiFleetPro() {
       {tab === "finance" && <FinanceView data={data} update={update} />}
       {tab === "reports" && <ReportsView data={data} />}
       {tab === "earnings" && <EarningsView data={data} update={update} />}
+      {tab === "audit" && <AuditView data={data} />}
     </Shell>
   );
 }
@@ -655,26 +746,18 @@ function SaveBadge({ state }) {
   return null;
 }
 
-function BackupControls({ onBackup, onRestore }) {
-  const fileRef = useRef(null);
+function BackupControls({ onBackup }) {
   if (!onBackup) return null;
   return (
     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
       <button type="button" className="btn" style={{ padding: "6px 10px", fontSize: 12 }} onClick={onBackup} aria-label="Descarcă backup al datelor" title="Descarcă o copie a tuturor datelor">
         <Download size={13} />Backup
       </button>
-      <button type="button" className="btn" style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => fileRef.current && fileRef.current.click()} aria-label="Restaurează din backup" title="Restaurează datele dintr-un fișier de backup">
-        <Upload size={13} />Restaurează
-      </button>
-      <input
-        ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
-        onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (f && onRestore) onRestore(f); }}
-      />
     </div>
   );
 }
 
-function Shell({ tab, setTab, children, loading, saveState, onBackup, onRestore }) {
+function Shell({ tab, setTab, children, loading, saveState, onBackup }) {
   // Anul din footer NU se calculează direct în JSX cu `new Date()`. Dacă am
   // face asta, Shell fiind randat mereu (inclusiv pe ramura de "loading"),
   // orice diferență de moment/fus orar/cache între randarea de pe server și
@@ -706,6 +789,7 @@ function Shell({ tab, setTab, children, loading, saveState, onBackup, onRestore 
     { label: "Bani", items: [
       { id: "finance", label: "Finanțe", icon: Wallet },
       { id: "reports", label: "Rapoarte", icon: BarChart3 },
+      { id: "audit", label: "Istoric modificări", icon: History },
     ] },
   ];
   const flatNav = navGroups.flatMap((g) => g.items);
@@ -821,7 +905,7 @@ function Shell({ tab, setTab, children, loading, saveState, onBackup, onRestore 
         </nav>
         <div className="tfp-sidebar-foot">
           <SaveBadge state={saveState} />
-          <BackupControls onBackup={onBackup} onRestore={onRestore} />
+          <BackupControls onBackup={onBackup} />
         </div>
       </aside>
 
@@ -859,7 +943,7 @@ function Shell({ tab, setTab, children, loading, saveState, onBackup, onRestore 
         {/* Backup și pe mobil (sidebar-ul e ascuns acolo) */}
         {onBackup && (
           <div className="tfp-footer" style={{ display: "flex", justifyContent: "center", paddingBottom: 6, borderTop: "none" }}>
-            <div className="tfp-mobile-backup"><BackupControls onBackup={onBackup} onRestore={onRestore} /></div>
+            <div className="tfp-mobile-backup"><BackupControls onBackup={onBackup} /></div>
           </div>
         )}
         <div className="tfp-footer">© {footerYear ?? ""} Nichita Ivanov. Toate drepturile rezervate.</div>
@@ -923,6 +1007,9 @@ function Dashboard({ data, setTab }) {
     return !dayRec;
   }).length;
 
+  // Același șofer cu încasări pe 2+ mașini azi → posibilă greșeală de introducere.
+  const dupToday = duplicateDriverDays(data, year, month, day);
+
   const stats = [
     { label: "Mașini", value: data.cars.length, icon: Car, sub: `${activeCars} active · ${inService} service` },
     { label: "Șoferi", value: data.drivers.length, icon: Users, sub: `${data.drivers.filter((d) => d.activ).length} activi` },
@@ -945,6 +1032,8 @@ function Dashboard({ data, setTab }) {
           </div>
         ))}
       </div>
+
+      <DuplicateDriverWarning items={dupToday} dateLabel="azi" />
 
       {missingTodayCount > 0 && (
         <div className="card" style={{ borderColor: "#f2b70555", marginBottom: 16, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
@@ -1026,6 +1115,26 @@ function EmptyState({ text }) {
   return <div style={{ color: "var(--muted)", fontSize: 13.5, padding: "18px 0", textAlign: "center" }}>{text}</div>;
 }
 
+// Avertisment: același șofer a adus bani pe 2+ mașini în aceeași zi.
+function DuplicateDriverWarning({ items, dateLabel }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div className="card" style={{ borderColor: "#e5484d55", marginBottom: 16, display: "flex", alignItems: "flex-start", gap: 10 }}>
+      <AlertTriangle size={17} color="var(--red)" style={{ marginTop: 2, flexShrink: 0 }} />
+      <div style={{ fontSize: 13.5 }}>
+        {items.length === 1 ? "Un șofer apare" : `${items.length} șoferi apar`} pe mai multe mașini în aceeași zi{dateLabel ? ` (${dateLabel})` : ""}. Verifică să nu fie o greșeală de introducere.
+        <div style={{ fontSize: 12.5, color: "var(--muted)", marginTop: 6, display: "flex", flexDirection: "column", gap: 2 }}>
+          {items.map((it) => (
+            <div key={it.driverId}>
+              <b style={{ color: "var(--text)" }}>{it.driver.nume}</b>: {it.cars.map((c) => `${c.carNr} (${fmtMoney(c.total)})`).join(" · ")}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function useEscape(onClose) {
   useEffect(() => {
     const h = (e) => { if (e.key === "Escape") onClose(); };
@@ -1066,12 +1175,34 @@ function CarsView({ data, update }) {
 
   const save = (car) => {
     update((prev) => {
-      const cars = car.id ? prev.cars.map((c) => (c.id === car.id ? car : c)) : [...prev.cars, { ...car, id: uid() }];
-      return { ...prev, cars };
+      const old = car.id ? prev.cars.find((c) => c.id === car.id) : null;
+      const saved = car.id ? car : { ...car, id: uid() };
+      const cars = car.id ? prev.cars.map((c) => (c.id === car.id ? car : c)) : [...prev.cars, saved];
+      const drvName = (id) => { const d = prev.drivers.find((x) => x.id === id); return d ? d.nume : "nealocat"; };
+      const entries = [];
+      if (!old) {
+        entries.push({ type: "masina", carId: saved.id, carNr: saved.nr, text: `Mașină adăugată: ${saved.nr} (${fmtRate(saved)})` });
+      } else {
+        if (old.nr !== saved.nr) entries.push({ type: "masina", carId: saved.id, carNr: saved.nr, text: `Număr schimbat: ${old.nr} → ${saved.nr}` });
+        if ((old.driverId || "") !== (saved.driverId || "")) {
+          entries.push({ type: "masina", carId: saved.id, carNr: saved.nr, driverId: saved.driverId || null, driverName: saved.driverId ? drvName(saved.driverId) : "", text: `Șofer schimbat la ${saved.nr}: ${drvName(old.driverId)} → ${drvName(saved.driverId)}` });
+        }
+        if (Number(old.tarif) !== Number(saved.tarif) || (old.tarifPeriod || "zi") !== (saved.tarifPeriod || "zi")) {
+          entries.push({ type: "masina", carId: saved.id, carNr: saved.nr, text: `Tarif ${saved.nr}: ${fmtRate(old)} → ${fmtRate(saved)}` });
+        }
+        if ((old.status || "activa") !== (saved.status || "activa")) {
+          entries.push({ type: "masina", carId: saved.id, carNr: saved.nr, text: `Status ${saved.nr}: ${CAR_STATUS_LABELS[old.status || "activa"] || old.status} → ${CAR_STATUS_LABELS[saved.status || "activa"] || saved.status}` });
+        }
+      }
+      return { ...prev, cars, auditLog: pushAudit(prev, entries) };
     });
     setEditing(null);
   };
-  const remove = (id) => update((prev) => ({ ...prev, cars: prev.cars.filter((c) => c.id !== id) }));
+  const remove = (id) => update((prev) => {
+    const old = prev.cars.find((c) => c.id === id);
+    const entries = old ? [{ type: "masina", carId: id, carNr: old.nr, text: `Mașină ștearsă: ${old.nr}` }] : [];
+    return { ...prev, cars: prev.cars.filter((c) => c.id !== id), auditLog: pushAudit(prev, entries) };
+  });
 
   return (
     <div>
@@ -1147,6 +1278,8 @@ function CarForm({ car, cars, drivers, onSave, onCancel }) {
   const [f, setF] = useState(car);
   const [err, setErr] = useState("");
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  // Șoferul ales e deja alocat la ALTĂ mașină? (avertisment, nu blocăm salvarea)
+  const driverClash = f.driverId ? (cars || []).find((c) => c.id !== f.id && c.driverId === f.driverId) : null;
   const trySave = () => {
     const nr = (f.nr || "").trim();
     if (!nr) { setErr("Completează numărul de înmatriculare."); return; }
@@ -1191,6 +1324,11 @@ function CarForm({ car, cars, drivers, onSave, onCancel }) {
           <option value="">— nealocat —</option>
           {drivers.map((d) => <option key={d.id} value={d.id}>{d.nume}</option>)}
         </select>
+        {driverClash && (
+          <div style={{ fontSize: 11.5, color: "var(--orange)", marginTop: 5, display: "flex", alignItems: "center", gap: 5 }}>
+            <AlertTriangle size={13} />Acest șofer este deja alocat la mașina {driverClash.nr}.
+          </div>
+        )}
       </div>
       <div className="field">
         <label>Status</label>
@@ -1278,21 +1416,31 @@ function UnavailablePeriodsEditor({ periods, onChange }) {
 function DriversView({ data, update }) {
   const [editing, setEditing] = useState(null);
   const [confirm, setConfirm] = useState(null);
+  const [profileId, setProfileId] = useState(null);
+  const profileDriver = profileId ? data.drivers.find((d) => d.id === profileId) : null;
   const empty = { nume: "", telefon: "", activ: true };
 
   const save = (drv) => {
     update((prev) => {
-      const drivers = drv.id ? prev.drivers.map((d) => (d.id === drv.id ? drv : d)) : [...prev.drivers, { ...drv, id: uid() }];
-      return { ...prev, drivers };
+      const isNew = !drv.id;
+      const saved = isNew ? { ...drv, id: uid() } : drv;
+      const drivers = isNew ? [...prev.drivers, saved] : prev.drivers.map((d) => (d.id === drv.id ? drv : d));
+      const entries = isNew ? [{ type: "sofer", driverId: saved.id, driverName: saved.nume, text: `Șofer adăugat: ${saved.nume}` }] : [];
+      return { ...prev, drivers, auditLog: pushAudit(prev, entries) };
     });
     setEditing(null);
   };
   const remove = (id) => {
-    update((prev) => ({
-      ...prev,
-      drivers: prev.drivers.filter((d) => d.id !== id),
-      cars: prev.cars.map((c) => (c.driverId === id ? { ...c, driverId: "" } : c)),
-    }));
+    update((prev) => {
+      const old = prev.drivers.find((d) => d.id === id);
+      const entries = old ? [{ type: "sofer", driverId: id, driverName: old.nume, text: `Șofer șters: ${old.nume}` }] : [];
+      return {
+        ...prev,
+        drivers: prev.drivers.filter((d) => d.id !== id),
+        cars: prev.cars.map((c) => (c.driverId === id ? { ...c, driverId: "" } : c)),
+        auditLog: pushAudit(prev, entries),
+      };
+    });
   };
 
   return (
@@ -1318,6 +1466,7 @@ function DriversView({ data, update }) {
                     <td>{car ? car.nr : <span style={{ color: "var(--muted)" }}>nealocat</span>}</td>
                     <td><span className="pill" style={{ background: d.activ ? "#2bb67322" : "#8b93a122", color: d.activ ? "var(--green)" : "var(--muted)" }}>{d.activ ? "Activ" : "Inactiv"}</span></td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                      <button className="btn" style={{ padding: 6, marginRight: 6 }} aria-label={`Fișa șoferului ${d.nume}`} title="Fișa șoferului" onClick={() => setProfileId(d.id)}><FileText size={14} /></button>
                       <button className="btn" style={{ padding: 6, marginRight: 6 }} aria-label={`Editează șoferul ${d.nume}`} onClick={() => setEditing(d)}><Pencil size={14} /></button>
                       <button className="btn danger" style={{ padding: 6 }} aria-label={`Șterge șoferul ${d.nume}`} onClick={() => setConfirm({ message: `Ștergi șoferul ${d.nume}? Istoricul plăților rămâne, dar fără numele lui. Dacă nu mai lucrează la tine, e mai bine să-l pui „Inactiv". Acțiunea nu poate fi anulată.`, action: () => remove(d.id) })}><Trash2 size={14} /></button>
                     </td>
@@ -1332,6 +1481,11 @@ function DriversView({ data, update }) {
       {editing && (
         <Modal onClose={() => setEditing(null)} title={editing.id ? "Editează șofer" : "Adaugă șofer"}>
           <DriverForm driver={editing} onSave={save} onCancel={() => setEditing(null)} />
+        </Modal>
+      )}
+      {profileDriver && (
+        <Modal onClose={() => setProfileId(null)} title={`Fișa șoferului — ${profileDriver.nume}`} maxWidth={780}>
+          <DriverProfile data={data} driver={profileDriver} />
         </Modal>
       )}
       {confirm && (
@@ -1400,13 +1554,29 @@ function WeeklyCalendarView({ data, update }) {
   const setWeekTotal = (car, weekIdx, cash, card) => {
     const k = weekKey(year, month, debtOwnerId(car), weekIdx);
     const paidAmount = Number(cash || 0) + Number(card || 0);
-    update((prev) => ({
-      ...prev,
-      weeklyPayments: {
-        ...prev.weeklyPayments,
-        [k]: { ...(prev.weeklyPayments[k] || {}), year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "total", paidCash: Number(cash || 0), paidCard: Number(card || 0), paidAmount },
-      },
-    }));
+    update((prev) => {
+      const old = prev.weeklyPayments[k];
+      const oldCash = Number((old && old.paidCash) || 0), oldCard = Number((old && old.paidCard) || 0);
+      const newCash = Number(cash || 0), newCard = Number(card || 0);
+      const parts = [];
+      if (oldCash !== newCash) parts.push(`numerar ${fmtMoney(oldCash)} → ${fmtMoney(newCash)}`);
+      if (oldCard !== newCard) parts.push(`card ${fmtMoney(oldCard)} → ${fmtMoney(newCard)}`);
+      const drv = prev.drivers.find((d) => d.id === car.driverId);
+      const entries = parts.length ? [{
+        type: "total", source: "Calendar", carId: car.id, carNr: car.nr,
+        driverId: car.driverId || null, driverName: drv ? drv.nume : "",
+        date: isoDay(year, month, 1),
+        text: `${car.nr}${drv ? " · " + drv.nume : ""} · total săpt. ${weekIdx + 1}, ${MONTHS_RO[month]} ${year}: ${parts.join(", ")}`,
+      }] : [];
+      return {
+        ...prev,
+        weeklyPayments: {
+          ...prev.weeklyPayments,
+          [k]: { ...(prev.weeklyPayments[k] || {}), year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "total", paidCash: newCash, paidCard: newCard, paidAmount },
+        },
+        auditLog: pushAudit(prev, entries),
+      };
+    });
   };
 
   const setWeekMode = (car, weekIdx, mode) => {
@@ -1457,22 +1627,41 @@ function WeeklyCalendarView({ data, update }) {
       const paidCard = Object.values(dailyAmounts).reduce((s, d) => s + (d.worked === false ? 0 : Number(d.card || 0)), 0);
       const paidAmount = paidCash + paidCard;
       const rec = { ...existing, year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "daily", dailyAmounts, paidCash, paidCard, paidAmount };
-      return { ...prev, weeklyPayments: { ...prev.weeklyPayments, [k]: rec } };
+      const entries = dayAuditEntries(prev, car, year, month, day, prevDay, merged, "Calendar");
+      return { ...prev, weeklyPayments: { ...prev.weeklyPayments, [k]: rec }, auditLog: pushAudit(prev, entries) };
     });
   };
 
   const setCarStartDate = (car, dateStr) => {
-    update((prev) => ({
-      ...prev,
-      cars: prev.cars.map((c) => (c.id === car.id ? { ...c, startDate: dateStr || null } : c)),
-    }));
+    update((prev) => {
+      const old = prev.cars.find((c) => c.id === car.id);
+      const before = (old && old.startDate) || null, after = dateStr || null;
+      const entries = before !== after ? [{
+        type: "masina", carId: car.id, carNr: car.nr,
+        text: `Data de început ${car.nr}: ${before ? fmtDateRO(before) : "—"} → ${after ? fmtDateRO(after) : "—"}`,
+      }] : [];
+      return {
+        ...prev,
+        cars: prev.cars.map((c) => (c.id === car.id ? { ...c, startDate: dateStr || null } : c)),
+        auditLog: pushAudit(prev, entries),
+      };
+    });
   };
 
   const setCarStatus = (car, status) => {
-    update((prev) => ({
-      ...prev,
-      cars: prev.cars.map((c) => (c.id === car.id ? { ...c, status } : c)),
-    }));
+    update((prev) => {
+      const old = prev.cars.find((c) => c.id === car.id);
+      const before = (old && old.status) || "activa";
+      const entries = before !== status ? [{
+        type: "masina", carId: car.id, carNr: car.nr,
+        text: `Status ${car.nr}: ${CAR_STATUS_LABELS[before] || before} → ${CAR_STATUS_LABELS[status] || status}`,
+      }] : [];
+      return {
+        ...prev,
+        cars: prev.cars.map((c) => (c.id === car.id ? { ...c, status } : c)),
+        auditLog: pushAudit(prev, entries),
+      };
+    });
   };
 
   if (data.cars.length === 0) {
@@ -2123,10 +2312,26 @@ function FinanceView({ data, update }) {
   const totalIncome = calendarIncome + extraIncome;
   const profit = totalIncome - totalExpenses;
 
-  const addExpense = (e) => update((prev) => ({ ...prev, expenses: [...prev.expenses, { ...e, id: uid() }] }));
-  const addIncome = (i) => update((prev) => ({ ...prev, incomes: [...prev.incomes, { ...i, id: uid() }] }));
-  const delExpense = (id) => update((prev) => ({ ...prev, expenses: prev.expenses.filter((e) => e.id !== id) }));
-  const delIncome = (id) => update((prev) => ({ ...prev, incomes: prev.incomes.filter((i) => i.id !== id) }));
+  const addExpense = (e) => update((prev) => {
+    const car = prev.cars.find((c) => c.id === e.carId);
+    const entry = { type: "cheltuiala", carId: e.carId || null, carNr: car ? car.nr : "", date: e.data, text: `Cheltuială adăugată: ${e.descriere} — ${fmtMoney(e.suma)} (${e.categorie}, ${fmtDateRO(e.data)}${car ? ", " + car.nr : ""})` };
+    return { ...prev, expenses: [...prev.expenses, { ...e, id: uid() }], auditLog: pushAudit(prev, [entry]) };
+  });
+  const addIncome = (i) => update((prev) => {
+    const entry = { type: "venit", date: i.data, text: `Venit extra adăugat: ${i.descriere} — ${fmtMoney(i.suma)} (${fmtDateRO(i.data)})` };
+    return { ...prev, incomes: [...prev.incomes, { ...i, id: uid() }], auditLog: pushAudit(prev, [entry]) };
+  });
+  const delExpense = (id) => update((prev) => {
+    const old = prev.expenses.find((e) => e.id === id);
+    const car = old ? prev.cars.find((c) => c.id === old.carId) : null;
+    const entries = old ? [{ type: "cheltuiala", carId: old.carId || null, carNr: car ? car.nr : "", date: old.data, text: `Cheltuială ștearsă: ${old.descriere} — ${fmtMoney(old.suma)} (${old.categorie}, ${fmtDateRO(old.data)}${car ? ", " + car.nr : ""})` }] : [];
+    return { ...prev, expenses: prev.expenses.filter((e) => e.id !== id), auditLog: pushAudit(prev, entries) };
+  });
+  const delIncome = (id) => update((prev) => {
+    const old = prev.incomes.find((i) => i.id === id);
+    const entries = old ? [{ type: "venit", date: old.data, text: `Venit extra șters: ${old.descriere} — ${fmtMoney(old.suma)} (${fmtDateRO(old.data)})` }] : [];
+    return { ...prev, incomes: prev.incomes.filter((i) => i.id !== id), auditLog: pushAudit(prev, entries) };
+  });
 
   const changeMonth = (delta) => {
     let m = month + delta, y = year;
@@ -2402,7 +2607,8 @@ function EarningsView({ data, update }) {
       const paidCard = Object.values(dailyAmounts).reduce((s, dd) => s + (dd.worked === false ? 0 : Number(dd.card || 0)), 0);
       const paidAmount = paidCash + paidCard;
       const rec = { ...existing, year, month, carId: car.id, driverId: car.driverId || null, weekIdx, mode: "daily", dailyAmounts, paidCash, paidCard, paidAmount };
-      return { ...prev, weeklyPayments: { ...prev.weeklyPayments, [k]: rec } };
+      const entries = dayAuditEntries(prev, car, year, month, day, prevDay, merged, "Încasări zilnice");
+      return { ...prev, weeklyPayments: { ...prev.weeklyPayments, [k]: rec }, auditLog: pushAudit(prev, entries) };
     });
   };
 
@@ -2412,6 +2618,14 @@ function EarningsView({ data, update }) {
     const driver = data.drivers.find((dd) => dd.id === car.driverId);
     return { car, driver, dayRec };
   });
+
+  // Șoferi care apar pe 2+ mașini în ziua afișată.
+  const dupes = useMemo(
+    () => duplicateDriverDays(data, year, month, day),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [data.weeklyPayments, data.cars, data.drivers, year, month, day]
+  );
+  const dupByDriver = useMemo(() => new Map(dupes.map((x) => [x.driverId, x.cars])), [dupes]);
 
   const totals = rows.reduce((acc, r) => {
     if (r.dayRec && r.dayRec.worked !== false) {
@@ -2469,6 +2683,8 @@ function EarningsView({ data, update }) {
         </div>
       </div>
 
+      <DuplicateDriverWarning items={dupes} dateLabel={fmtDateRO(date)} />
+
       <div className="finance-grid" style={{ display: "grid", gap: 10, marginBottom: 16 }}>
         <MiniStat label="Numerar azi" value={fmtMoney(totals.cash)} color="var(--green)" />
         <MiniStat label="Card azi" value={fmtMoney(totals.card)} color="var(--green)" />
@@ -2496,10 +2712,13 @@ function EarningsView({ data, update }) {
             <tbody>
               {filteredRows.map(({ car, driver, dayRec }) => {
                 const worked = dayRec ? dayRec.worked !== false : true;
+                const who = (dayRec && dayRec.driverId) || car.driverId;
+                const otherCars = (dupByDriver.get(who) || []).filter((c) => c.carId !== car.id).map((c) => c.carNr);
                 return (
                   <EarningsRow
                     key={`${date}-${car.id}`}
                     car={car} driver={driver} dayRec={dayRec} worked={worked}
+                    otherCars={otherCars}
                     onCommit={(entry) => setDay(car, entry)}
                     onToggleWorked={(w) => setDay(car, { worked: w })}
                   />
@@ -2534,7 +2753,7 @@ function EarningsView({ data, update }) {
   );
 }
 
-function EarningsRow({ car, driver, dayRec, worked, onCommit, onToggleWorked }) {
+function EarningsRow({ car, driver, dayRec, worked, otherCars, onCommit, onToggleWorked }) {
   const [cash, setCash] = useState(dayRec ? dayRec.cash : "");
   const [card, setCard] = useState(dayRec ? dayRec.card : "");
   const commit = () => onCommit({ cash, card, worked: true });
@@ -2545,6 +2764,13 @@ function EarningsRow({ car, driver, dayRec, worked, onCommit, onToggleWorked }) 
       <td>
         <div style={{ fontWeight: 600 }}>{driver ? driver.nume : <span style={{ color: "var(--muted)" }}>—</span>}</div>
         <div style={{ fontSize: 11.5, color: "var(--muted)" }}>{car.nr}{car.marca ? ` · ${car.marca} ${car.model}` : ""}</div>
+        {otherCars && otherCars.length > 0 && (
+          <div style={{ marginTop: 4 }}>
+            <span className="pill" style={{ background: "#e5484d22", color: "var(--red)" }}>
+              <AlertTriangle size={11} />și pe {otherCars.join(", ")} în aceeași zi
+            </span>
+          </div>
+        )}
       </td>
       <td>
         <div className="modetoggle">
@@ -2770,13 +2996,286 @@ function ReportsView({ data }) {
   );
 }
 
+/* ============================== ISTORIC MODIFICĂRI ============================== */
+
+const AUDIT_TYPE_META = {
+  incasare:   { label: "Încasare",    color: "var(--green)",  bg: "#2bb67322" },
+  total:      { label: "Total săpt.", color: "var(--green)",  bg: "#2bb67322" },
+  cheltuiala: { label: "Cheltuială",  color: "var(--red)",    bg: "#e5484d22" },
+  venit:      { label: "Venit extra", color: "var(--amber)",  bg: "#f2b70522" },
+  masina:     { label: "Mașină",      color: "var(--orange)", bg: "#f2841c22" },
+  sofer:      { label: "Șofer",       color: "var(--orange)", bg: "#f2841c22" },
+};
+const AUDIT_FILTERS = [
+  { id: "toate", label: "Toate" },
+  { id: "incasare", label: "Încasări" },
+  { id: "total", label: "Totaluri săpt." },
+  { id: "cheltuiala", label: "Cheltuieli" },
+  { id: "venit", label: "Venituri extra" },
+  { id: "masina", label: "Mașini" },
+  { id: "sofer", label: "Șoferi" },
+];
+
+function AuditView({ data }) {
+  const [typeFilter, setTypeFilter] = useState("toate");
+  const [search, setSearch] = useState("");
+  const [limit, setLimit] = useState(60);
+  const log = data.auditLog || [];
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return log.filter((e) => {
+      if (typeFilter !== "toate" && e.type !== typeFilter) return false;
+      if (!q) return true;
+      return (e.text || "").toLowerCase().includes(q) || (e.carNr || "").toLowerCase().includes(q) || (e.driverName || "").toLowerCase().includes(q);
+    });
+  }, [log, typeFilter, search]);
+
+  const visible = filtered.slice(0, limit);
+
+  return (
+    <div>
+      <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 12 }}>
+        Aici vezi ce s-a modificat, când și cu ce valori (înainte → după). Istoricul începe din momentul în care a fost adăugată această filă și păstrează ultimele {AUDIT_MAX} modificări.
+      </div>
+
+      <div className="field" style={{ position: "relative", marginBottom: 10 }}>
+        <Search size={15} color="var(--muted)" style={{ position: "absolute", left: 11, top: "50%", transform: "translateY(-50%)" }} />
+        <input
+          value={search}
+          onChange={(e) => { setSearch(e.target.value); setLimit(60); }}
+          placeholder="Caută după mașină, șofer sau text…"
+          style={{ paddingLeft: 34 }}
+        />
+      </div>
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+        {AUDIT_FILTERS.map((f) => (
+          <button
+            key={f.id}
+            className={"btn" + (typeFilter === f.id ? " primary" : "")}
+            style={{ padding: "7px 12px", fontSize: 12.5 }}
+            onClick={() => { setTypeFilter(f.id); setLimit(60); }}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
+
+      {log.length === 0 ? (
+        <div className="card"><EmptyState text="Nicio modificare înregistrată încă. De acum încolo, orice sumă introdusă sau schimbată apare aici." /></div>
+      ) : filtered.length === 0 ? (
+        <div className="card"><EmptyState text="Nimic găsit pentru filtrul ales." /></div>
+      ) : (
+        <div className="card" style={{ padding: "6px 16px" }}>
+          {visible.map((e) => {
+            const meta = AUDIT_TYPE_META[e.type] || { label: "Altceva", color: "var(--muted)", bg: "#8b93a122" };
+            return (
+              <div key={e.id} style={{ display: "flex", gap: 12, padding: "11px 0", borderBottom: "1px solid #ffffff0a", alignItems: "flex-start", flexWrap: "wrap" }}>
+                <div style={{ width: 118, flexShrink: 0 }}>
+                  <div className="mono" style={{ fontSize: 12 }}>{fmtDateTimeRO(e.at)}</div>
+                  {e.source && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{e.source}</div>}
+                </div>
+                <span className="pill" style={{ background: meta.bg, color: meta.color, flexShrink: 0 }}>{meta.label}</span>
+                <div style={{ fontSize: 13.5, flex: "1 1 240px", minWidth: 0, overflowWrap: "anywhere" }}>{e.text}</div>
+              </div>
+            );
+          })}
+          {filtered.length > visible.length && (
+            <div style={{ padding: "12px 0", textAlign: "center" }}>
+              <button className="btn" onClick={() => setLimit((n) => n + 60)}>Arată mai multe ({filtered.length - visible.length} rămase)</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================== FIȘA ȘOFERULUI ============================== */
+
+function DriverProfile({ data, driver }) {
+  const now = nowMoldova();
+  const [year, setYear] = useState(now.getFullYear());
+  const [month, setMonth] = useState(now.getMonth());
+  const mk = monthKey(year, month);
+
+  const records = useMemo(
+    () => driverDayRecords(data, driver.id),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [data.weeklyPayments, data.cars, driver.id]
+  );
+
+  const car = data.cars.find((c) => c.driverId === driver.id);
+  const monthRecs = records.filter((r) => r.year === year && r.month === month).sort((a, b) => a.day - b.day);
+  const incomeDays = monthRecs.filter((r) => r.worked && r.cash + r.card > 0);
+  const offDays = monthRecs.filter((r) => !r.worked);
+  const cash = incomeDays.reduce((s, r) => s + r.cash, 0);
+  const card = incomeDays.reduce((s, r) => s + r.card, 0);
+  const total = cash + card;
+  const avg = incomeDays.length ? total / incomeDays.length : 0;
+
+  // Sume introduse DOAR ca total pe săptămână (fără detaliu pe zile) — nu pot fi puse pe o zi anume.
+  const weeklyOnly = Object.values(data.weeklyPayments || {})
+    .filter((rec) => rec && rec.year === year && rec.month === month && rec.driverId === driver.id && Object.keys(rec.dailyAmounts || {}).length === 0)
+    .reduce((s, rec) => s + Number(rec.paidAmount || 0), 0);
+
+  const expenses = data.expenses.filter((e) => e.șoferId === driver.id && e.data && e.data.startsWith(mk));
+  const expensesTotal = expenses.reduce((s, e) => s + Number(e.suma || 0), 0);
+
+  // Pe ce mașini a adus bani luna asta.
+  const byCar = useMemo(() => {
+    const map = new Map();
+    incomeDays.forEach((r) => {
+      const cur = map.get(r.carId) || { carNr: r.carNr, days: 0, total: 0 };
+      cur.days += 1; cur.total += r.cash + r.card;
+      map.set(r.carId, cur);
+    });
+    return Array.from(map.values()).sort((a, b) => b.total - a.total);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [records, year, month]);
+
+  // Ultimele 6 luni (până la luna aleasă).
+  const history = [];
+  for (let i = 0; i < 6; i++) {
+    let m = month - i, y = year;
+    while (m < 0) { m += 12; y -= 1; }
+    const rs = records.filter((r) => r.year === y && r.month === m && r.worked && r.cash + r.card > 0);
+    const t = rs.reduce((s, r) => s + r.cash + r.card, 0);
+    history.push({ y, m, days: rs.length, total: t, avg: rs.length ? t / rs.length : 0 });
+  }
+
+  // Restanța e pe MAȘINĂ (nu pe șofer), deci o arătăm pentru mașina lui actuală.
+  const carRest = car && isCarActive(car)
+    ? Math.max(monthlyPlanWithCarry(data, car, year, month) - monthlyPaid(data, year, month, debtOwnerId(car)), 0)
+    : 0;
+
+  const changeMonth = (delta) => {
+    let m = month + delta, y = year;
+    if (m < 0) { m = 11; y -= 1; }
+    if (m > 11) { m = 0; y += 1; }
+    setMonth(m); setYear(y);
+  };
+
+  // Mesaj pentru WhatsApp.
+  const summary = [
+    `Raport ${driver.nume} — ${MONTHS_RO[month]} ${year}`,
+    `Zile cu încasare: ${incomeDays.length}`,
+    `Numerar: ${fmtMoney(cash)}`,
+    `Card: ${fmtMoney(card)}`,
+    `Total adus: ${fmtMoney(total)}`,
+    ...(incomeDays.length ? [`Medie pe zi: ${fmtMoney(avg)}`] : []),
+    ...(offDays.length ? [`Zile libere / nelucrate: ${offDays.length}`] : []),
+    ...(car && carRest > 0 ? [`Restanță mașina ${car.nr}: ${fmtMoney(carRest)}`] : []),
+  ].join("\n");
+  let phone = (driver.telefon || "").replace(/\D/g, "");
+  if (/^0\d{8}$/.test(phone)) phone = "373" + phone.slice(1); // 06X XXX XXX → 3736X XXX XXX
+  const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(summary)}`;
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
+        <span className="pill" style={{ background: driver.activ ? "#2bb67322" : "#8b93a122", color: driver.activ ? "var(--green)" : "var(--muted)" }}>{driver.activ ? "Activ" : "Inactiv"}</span>
+        {driver.telefon && <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 13 }}><Phone size={12} />{driver.telefon}</span>}
+        <span style={{ fontSize: 13, color: "var(--muted)" }}>Mașină: {car ? car.nr : "nealocat"}</span>
+        <a className="btn" style={{ marginLeft: "auto", textDecoration: "none" }} href={waUrl} target="_blank" rel="noopener noreferrer">
+          <Send size={14} />Trimite pe WhatsApp
+        </a>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+        <button className="btn" style={{ padding: 8 }} aria-label="Luna anterioară" onClick={() => changeMonth(-1)}><ChevronLeft size={16} /></button>
+        <div className="disp" style={{ fontSize: 16, fontWeight: 700, minWidth: 150, textAlign: "center" }}>{MONTHS_RO[month]} {year}</div>
+        <button className="btn" style={{ padding: 8 }} aria-label="Luna următoare" onClick={() => changeMonth(1)}><ChevronRight size={16} /></button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(135px, 1fr))", gap: 10, marginBottom: 12 }}>
+        <MiniStat label="Total adus" value={fmtMoney(total)} color="var(--green)" />
+        <MiniStat label="Numerar" value={fmtMoney(cash)} color="var(--text)" />
+        <MiniStat label="Card" value={fmtMoney(card)} color="var(--text)" />
+        <MiniStat label="Zile cu încasare" value={String(incomeDays.length)} color="var(--amber)" />
+        <MiniStat label="Medie / zi" value={fmtMoney(avg)} color="var(--amber)" />
+        <MiniStat label="Zile libere" value={String(offDays.length)} color="var(--muted)" />
+      </div>
+
+      {weeklyOnly > 0 && (
+        <div style={{ fontSize: 12, color: "var(--orange)", marginBottom: 10, display: "flex", alignItems: "center", gap: 5 }}>
+          <AlertTriangle size={13} />Încă {fmtMoney(weeklyOnly)} au fost introduși doar ca total pe săptămână (fără zile) — nu apar în tabelul de mai jos.
+        </div>
+      )}
+      {car && carRest > 0 && (
+        <div style={{ fontSize: 12.5, color: "var(--orange)", marginBottom: 10, display: "flex", alignItems: "center", gap: 5 }}>
+          <AlertTriangle size={13} />Restanță pe mașina {car.nr} în {MONTHS_RO[month]}: <b className="mono">{fmtMoney(carRest)}</b> <span style={{ color: "var(--muted)" }}>(restanța e calculată pe mașină, nu pe șofer)</span>
+        </div>
+      )}
+      {expensesTotal > 0 && (
+        <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 10 }}>
+          Cheltuieli legate de acest șofer în {MONTHS_RO[month]}: <b className="mono" style={{ color: "var(--red)" }}>{fmtMoney(expensesTotal)}</b> ({expenses.length})
+        </div>
+      )}
+
+      {byCar.length > 0 && (
+        <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 14 }}>
+          Pe mașini: {byCar.map((c) => `${c.carNr} — ${c.days} zile, ${fmtMoney(c.total)}`).join(" · ")}
+        </div>
+      )}
+
+      <div style={{ fontWeight: 700, marginBottom: 6 }} className="disp">Zile din {MONTHS_RO[month]}</div>
+      {monthRecs.length === 0 ? (
+        <EmptyState text="Nicio zi introdusă pentru acest șofer în luna aleasă." />
+      ) : (
+        <div style={{ overflowX: "auto", marginBottom: 16 }}>
+          <table>
+            <thead><tr><th>Zi</th><th>Mașină</th><th>Numerar</th><th>Card</th><th>Total</th><th>Notă</th></tr></thead>
+            <tbody>
+              {monthRecs.map((r) => (
+                <tr key={`${r.carId}-${r.day}`} style={!r.worked ? { opacity: 0.55 } : undefined}>
+                  <td>{dayLabel(year, month, r.day)}</td>
+                  <td>{r.carNr}</td>
+                  {r.worked ? (
+                    <>
+                      <td className="mono">{fmtMoney(r.cash)}</td>
+                      <td className="mono">{fmtMoney(r.card)}</td>
+                      <td className="mono" style={{ fontWeight: 700 }}>{fmtMoney(r.cash + r.card)}</td>
+                    </>
+                  ) : (
+                    <td colSpan={3} style={{ color: "var(--muted)", fontSize: 12.5 }}>Nu a lucrat</td>
+                  )}
+                  <td style={{ fontSize: 12, color: "var(--muted)" }}>{r.note}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div style={{ fontWeight: 700, marginBottom: 6 }} className="disp">Ultimele 6 luni</div>
+      <div style={{ overflowX: "auto" }}>
+        <table>
+          <thead><tr><th>Luna</th><th>Zile cu încasare</th><th>Total adus</th><th>Medie / zi</th></tr></thead>
+          <tbody>
+            {history.map((h) => (
+              <tr key={`${h.y}-${h.m}`}>
+                <td>{MONTHS_RO[h.m]} {h.y}</td>
+                <td className="mono">{h.days}</td>
+                <td className="mono" style={{ fontWeight: 700, color: h.total > 0 ? "var(--green)" : "var(--muted)" }}>{fmtMoney(h.total)}</td>
+                <td className="mono">{h.days ? fmtMoney(h.avg) : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 /* ============================== MODAL ============================== */
 
-function Modal({ title, children, onClose }) {
+function Modal({ title, children, onClose, maxWidth }) {
   useEscape(onClose);
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}>
+      <div className="modal" role="dialog" aria-modal="true" aria-label={title} style={maxWidth ? { maxWidth } : undefined} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
           <div className="disp" style={{ fontWeight: 700, fontSize: 16 }}>{title}</div>
           <button className="btn" style={{ padding: 6 }} aria-label="Închide" onClick={onClose}><X size={15} /></button>

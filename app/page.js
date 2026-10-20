@@ -1011,8 +1011,11 @@ function Dashboard({ data, setTab }) {
 
   const carNr = (id) => { const c = data.cars.find((x) => x.id === id); return c ? c.nr : "mașină ștearsă"; };
   const expiryText = (days) => (days < 0 ? "expirată" : days === 0 ? "expiră azi" : `în ${days} zile`);
-  const insuranceAlerts = data.insurances.filter((ins) => { const d = daysUntil(ins.dataExpirare); return d != null && d <= 30; });
-  const inspectionAlerts = data.inspections.filter((insp) => { const d = daysUntil(insp.dataExpirare); return d != null && d <= 30; });
+  // Alertele ignoră mașinile care nu sunt active (în service / vândute) —
+  // oricum nu lucrează. Rămân în filele Asigurări / Revizie tehnică.
+  const carIsActiveById = (id) => { const c = data.cars.find((x) => x.id === id); return !c || isCarActive(c); };
+  const insuranceAlerts = data.insurances.filter((ins) => { const d = daysUntil(ins.dataExpirare); return d != null && d <= 30 && carIsActiveById(ins.carId); });
+  const inspectionAlerts = data.inspections.filter((insp) => { const d = daysUntil(insp.dataExpirare); return d != null && d <= 30 && carIsActiveById(insp.carId); });
   const insuranceDetail = insuranceAlerts.map((i) => `${carNr(i.carId)} (${i.tip ? i.tip.toLowerCase() + ", " : ""}${expiryText(daysUntil(i.dataExpirare))})`).join(" · ");
   const inspectionDetail = inspectionAlerts.map((i) => `${carNr(i.carId)} (${expiryText(daysUntil(i.dataExpirare))})`).join(" · ");
 

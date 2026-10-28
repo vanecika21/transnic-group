@@ -16,6 +16,11 @@ import {
    automatically to the next month's plan.
 
    MODIFICĂRI FĂCUTE (față de versiunea anterioară):
+   - NOU: Mașinile care au adus 0 lei în LUNA CURENTĂ nu se mai iau în
+     calcul la restanțe: nu apar în Rapoarte (tabel + totaluri), nu intră
+     în "Restanță lună" din Finanțe, în alerta de restanțe de pe Dashboard
+     și în restanța din Fișa șoferului. Se aplică doar pentru luna curentă
+     (vezi zeroBroughtThisMonth). Lunile trecute rămân neschimbate.
    - NOU: Căutare comună (carMatchesSearch) în Calendar și Încasări zilnice:
      se caută după nume șofer ȘI după nr. de înmatriculare (plus marcă/model).
      Ignoră majusculele, diacriticele și spațiile ("ewm110" găsește "EWM 110").
@@ -515,6 +520,18 @@ function hasAnyRecordForMonth(data, year, month, ownerId) {
   return false;
 }
 function prevMonth(year, month) { return month === 0 ? { year: year - 1, month: 11 } : { year, month: month - 1 }; }
+
+/* ---------------- MAȘINI CU 0 ADUS ÎN LUNA CURENTĂ ----------------
+   O mașină care n-a adus nimic (0 lei) în LUNA CURENTĂ nu se ia în calcul la
+   restanțe: nu apare în Rapoarte și nu intră în totalul de restanțe (Rapoarte,
+   Finanțe, alerta de pe Dashboard, Fișa șoferului). Se aplică DOAR pentru luna
+   curentă; pentru lunile trecute restanțele rămân calculate ca înainte.
+   Dacă vrei să o aplici pentru orice lună afișată, scoate verificarea de lună. */
+function zeroBroughtThisMonth(data, car, year, month) {
+  const now = nowMoldova();
+  if (year !== now.getFullYear() || month !== now.getMonth()) return false;
+  return monthlyPaid(data, year, month, debtOwnerId(car)) <= 0;
+}
 
 function carryoverFromPrevMonth(data, car, year, month) {
   if (!isCarActive(car)) return 0;
@@ -1073,7 +1090,8 @@ function Dashboard({ data, setTab }) {
     .filter((e) => e.data && e.data.startsWith(monthKey(year, month)) && Number(e.data.slice(8, 10)) >= range.start && Number(e.data.slice(8, 10)) <= range.end)
     .reduce((s, e) => s + Number(e.suma || 0), 0);
   const profitWeek = incomeWeek - expensesWeek;
-  const problemCount = weekRows.filter((r) => r.status === "unpaid" || r.status === "partial").length;
+  // Mașinile care au adus 0 în luna curentă nu se numără la restanțe.
+  const problemCount = weekRows.filter((r) => (r.status === "unpaid" || r.status === "partial") && !zeroBroughtThisMonth(data, r.car, year, month)).length;
 
   const carNr = (id) => { const c = data.cars.find((x) => x.id === id); return c ? c.nr : "mașină ștearsă"; };
   const expiryText = (days) => (days < 0 ? "expirată" : days === 0 ? "expiră azi" : `în ${days} zile`);
@@ -2489,6 +2507,7 @@ function FinanceView({ data, update }) {
 
   const restante = data.cars.reduce((s, car) => {
     if (!car.driverId) return s; // doar mașini cu șofer alocat momentan
+    if (zeroBroughtThisMonth(data, car, year, month)) return s; // 0 adus în luna curentă → nu intră la restanțe
     const plan = monthlyPlanBase(data, car, year, month); // fără moștenire din lunile trecute — pornește curat, de azi
     const paid = monthlyPaid(data, year, month, debtOwnerId(car));
     return s + Math.max(plan - paid, 0);
@@ -3012,16 +3031,20 @@ function ReportsView({ data }) {
   const [search, setSearch] = useState("");
 
   const perCar = useMemo(() => {
-    const rows = data.cars.filter((car) => car.driverId).map((car) => {
-      const planBase = monthlyPlanBase(data, car, year, month);
-      const plan = monthlyPlanWithCarry(data, car, year, month);
-      const paid = monthlyPaid(data, year, month, debtOwnerId(car));
-      const carryover = carryoverFromPrevMonth(data, car, year, month);
-      const driver = data.drivers.find((d) => d.id === car.driverId);
-      const rest = Math.max(plan - paid, 0);
-      const status = statusOf(plan, paid);
-      return { car, driver, planBase, plan, paid, rest, carryover, status };
-    });
+    const rows = data.cars
+      .filter((car) => car.driverId)
+      // Mașinile care au adus 0 în luna curentă nu se arată și nu intră la restanțe.
+      .filter((car) => !zeroBroughtThisMonth(data, car, year, month))
+      .map((car) => {
+        const planBase = monthlyPlanBase(data, car, year, month);
+        const plan = monthlyPlanWithCarry(data, car, year, month);
+        const paid = monthlyPaid(data, year, month, debtOwnerId(car));
+        const carryover = carryoverFromPrevMonth(data, car, year, month);
+        const driver = data.drivers.find((d) => d.id === car.driverId);
+        const rest = Math.max(plan - paid, 0);
+        const status = statusOf(plan, paid);
+        return { car, driver, planBase, plan, paid, rest, carryover, status };
+      });
     // Restanțele mai mari primele, ca să vezi imediat ce trebuie urmărit.
     return rows.sort((a, b) => b.rest - a.rest || b.paid - a.paid);
   }, [data, year, month]);
@@ -3083,7 +3106,7 @@ function ReportsView({ data }) {
         <MiniStat label="Restanțe total" value={fmtMoney(totals.rest)} color={totals.rest > 0 ? "var(--orange)" : "var(--muted)"} />
       </div>
       <div style={{ fontSize: 11.5, color: "var(--muted)", marginBottom: 18 }}>
-        „Total de recuperat" = chiria lunii curente + orice restanță neachitată din lunile anterioare, adunată automat.
+        „Total de recuperat" = chiria lunii curente + orice restanță neachitată din lunile anterioare, adunată automat. Mașinile care au adus 0 lei în luna curentă nu sunt afișate și nu intră în totaluri.
       </div>
 
       {orphanDebts.length > 0 && (
@@ -3109,7 +3132,7 @@ function ReportsView({ data }) {
       )}
 
       {perCar.length === 0 ? (
-        <div className="card"><EmptyState text="Nicio mașină cu șofer alocat momentan." /></div>
+        <div className="card"><EmptyState text="Nicio mașină de afișat momentan (mașinile cu 0 adus în luna curentă sunt ascunse)." /></div>
       ) : (
         <>
           <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
@@ -3358,7 +3381,8 @@ function DriverProfile({ data, driver }) {
   }
 
   // Restanța e pe MAȘINĂ (nu pe șofer), deci o arătăm pentru mașina lui actuală.
-  const carRest = car && isCarActive(car)
+  // Dacă mașina a adus 0 în luna curentă, nu se arată restanță.
+  const carRest = car && isCarActive(car) && !zeroBroughtThisMonth(data, car, year, month)
     ? Math.max(monthlyPlanWithCarry(data, car, year, month) - monthlyPaid(data, year, month, debtOwnerId(car)), 0)
     : 0;
 

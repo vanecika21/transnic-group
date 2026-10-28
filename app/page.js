@@ -3011,7 +3011,11 @@ function ReportsView({ data }) {
   const [filter, setFilter] = useState("toate");
   const [search, setSearch] = useState("");
 
-  const perCar = useMemo(() => {
+  const perCar = useMemo(() =>   const perCar = useMemo(() => {
+    // Luna afișată este luna curentă? (doar atunci ascundem mașinile cu 0 adus)
+    const nowM = nowMoldova();
+    const isCurrentMonth = year === nowM.getFullYear() && month === nowM.getMonth();
+
     const rows = data.cars.filter((car) => car.driverId).map((car) => {
       const planBase = monthlyPlanBase(data, car, year, month);
       const plan = monthlyPlanWithCarry(data, car, year, month);
@@ -3022,8 +3026,13 @@ function ReportsView({ data }) {
       const status = statusOf(plan, paid);
       return { car, driver, planBase, plan, paid, rest, carryover, status };
     });
+
+    // În luna curentă: mașinile care au adus 0 lei nu se afișează
+    // și nu intră în totaluri / restanțe.
+    const visible = isCurrentMonth ? rows.filter((r) => r.paid > 0) : rows;
+
     // Restanțele mai mari primele, ca să vezi imediat ce trebuie urmărit.
-    return rows.sort((a, b) => b.rest - a.rest || b.paid - a.paid);
+    return visible.sort((a, b) => b.rest - a.rest || b.paid - a.paid);
   }, [data, year, month]);
 
   // Profit pe mașină = ce a adus mașina în luna asta − cheltuielile legate de ea.
